@@ -1,3 +1,8 @@
+"""
+This script defines a dataset class `MathOperationsDataset` for generating simple mathematical expressions
+and their results, tokenized for use in LLM models. It also includes a custom tokenizer
+for character-level tokenization of mathematical symbols.
+"""
 import random
 import torch
 from torch.utils.data import Dataset

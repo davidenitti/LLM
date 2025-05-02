@@ -19,11 +19,11 @@ from functools import partial
 from checks import check_tensors, check_model
 from rotary_pos import precompute_freqs, apply_rotary_emb
 
-import rnn
 from blocks import SoftGradHardTanh, SoftGradHardSigmoid
 from torch.nn import GELU
 
 from basic_transformer import SelfAttention
+
 
 class CustomGPTConfig(PretrainedConfig):
     """
@@ -354,8 +354,9 @@ class CustomGPTmodel(PreTrainedModel):
 def custom_config(name_config):
     if name_config == "custom:gptv0":
         return CustomGPTConfig()
-    elif name_config == "custom:rnnv0":
-        return rnn.CustomRNNConfig()
+    # elif name_config == "custom:rnnv0":
+    #     import rnn
+    #     return rnn.CustomRNNConfig()
     else:
         raise NotImplementedError()
 
@@ -363,7 +364,7 @@ def custom_config(name_config):
 def custom_model(config):
     if isinstance(config, CustomGPTConfig):
         return CustomGPTmodel(config)
-    elif isinstance(config, rnn.CustomRNNConfig):
-        return rnn.CustomRNNmodel(config)
+    # elif isinstance(config, rnn.CustomRNNConfig):
+    #     return rnn.CustomRNNmodel(config)
     else:
         raise NotImplementedError()

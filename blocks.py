@@ -57,6 +57,6 @@ def vis(model):
     plt.ylabel('Gradient')
     plt.show()
 
-# if __name__ == "__main__":
-#     vis(SoftGradHardTanh())
-#     vis(SoftGradHardSigmoid())
+if __name__ == "__main__":
+    vis(SoftGradHardTanh())
+    vis(SoftGradHardSigmoid())

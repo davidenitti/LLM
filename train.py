@@ -22,7 +22,6 @@ from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 from gpu_free import wait_until_gpu_memory_free
 import transformers
-import scheduler
 from transformers import (
     CONFIG_MAPPING,
     MODEL_MAPPING,
@@ -290,7 +289,7 @@ def parse_args(args_list):
         help="maximum value for the math operations dataset in the training set",
     )
 
-    parser.add_argument("--no_wait", action="store_true", help="Do not wait for GPU")
+    parser.add_argument("--wait", action="store_true", help="wait for GPU")
     parser.add_argument(
         "--overwrite_cache", action="store_true", help="Overwrite the cached training and evaluation sets"
     )
@@ -379,8 +378,9 @@ def main(args_list=None, trial=None):
         prepend_eos = True
         args.dataset_config_name = ""
     else:
+        # for "Salesforce/wikitext" prepend is not a good idea, because often consecutive texts are of the same sentence.
         prepend_eos = False
-    if not args.no_wait:
+    if args.wait:
         wait_until_gpu_memory_free(min_free_memory=args.per_device_train_batch_size * 1300 + 1500, check_interval=100)
 
     # Initialize the accelerator. We will let the accelerator handle device placement for us in this example.
@@ -752,6 +752,8 @@ def main(args_list=None, trial=None):
         args.max_train_steps if overrode_max_train_steps else args.max_train_steps * accelerator.num_processes
     )
     if "_mod" in args.lr_scheduler_type:
+        import scheduler
+
         lr_scheduler = getattr(scheduler, args.lr_scheduler_type)(
             optimizer=optimizer,
             num_warmup_steps=args.num_warmup_steps * accelerator.num_processes,
@@ -1018,11 +1020,15 @@ def main(args_list=None, trial=None):
                         log_kwargs={"wandb": {"commit": True}},
                     )
                     if trial is not None:
-                        trial.report(perplexity, completed_steps // args.log_every_steps)
+                        if args.dataset_name == "custom:math_dataset":
+                            metric = acc_val
+                        else:
+                            metric = perplexity
+                        trial.report(metric, completed_steps)
                         if trial.should_prune():
                             raise optuna.exceptions.TrialPruned()
-                        if completed_steps > 20000:
-                            return perplexity
+                        if completed_steps >= args.max_train_steps - 2:
+                            return metric
                     total_loss = 0
                     num_loss = 0
             if completed_steps >= args.max_train_steps:
@@ -1193,18 +1199,7 @@ def compute_acc_math(model, eval_dataloader, tokenizer, max_data=10000):
                         print("acc", acc[b])
                         print((predicted_tokens == gt), (predicted_tokens == gt).shape)
                         break
-                    # print("full",tokenizer.decode(input_full[0]))
-                    # print("inp",tokenizer.decode(input_ids[0]))
-                    # print("gt",tokenizer.decode(gt_res[0]))
-                    # print("out",tokenizer.decode(output[0]))
-                    # print("out compared",tokenizer.decode(output[0][idx + 1: idx_end+1]))
-                    # breakpoint()
-            # print("---------------------")
-            # print(tokenizer.decode(batch["input_ids"][1],skip_special_tokens=True))
-            # print(tokenizer.decode(predicted_tokens[1],skip_special_tokens=True))
-            # print(tokenizer.decode(gt[1],skip_special_tokens=True))
-            # print((predicted_tokens == gt).float().min(dim=-1).values[1])
-            # print("---------------------")
+
     avg_acc = sum_acc / acc_num
     assert acc_num == sum(count_dict.values())
     assert sum_acc == sum(acc_dict.values())
