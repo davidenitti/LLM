@@ -241,9 +241,9 @@ def parse_args(args_list):
         default="cosine_with_min_lr",
         help="The scheduler type to use.",
         choices=[
-            "ReduceLROnPlateau_mod",
+            # "ReduceLROnPlateau_mod",
             "cosine_with_min_lr",
-            "cosine_with_min_lr_mod",
+            # "cosine_with_min_lr_mod",
             "linear",
             "cosine",
             "cosine_with_restarts",
@@ -916,13 +916,14 @@ def main(args_list=None, trial=None):
                         )
                 accelerator.backward(loss)
                 if accelerator.sync_gradients and args.grad_clip_value is not None:
+                    # TODO TO CHECK IF IT'S CORRECT
                     accelerator.clip_grad_norm_(model.parameters(), max_norm=args.grad_clip_value)
                 #     for name, param in model.named_parameters():
                 #         if param.grad is not None and param.grad.norm().item() > 1:
                 #             print(completed_steps,name, param.grad.norm().item())
                 optimizer.step()
-                if isinstance(lr_scheduler.scheduler, scheduler.ReduceLROnPlateau_mod):
-                    lr_scheduler.scheduler.update(loss.detach().float().item(), step)
+                # if isinstance(lr_scheduler.scheduler, scheduler.ReduceLROnPlateau_mod):
+                #     lr_scheduler.scheduler.update(loss.detach().float().item(), step)
                 lr_scheduler.step()
                 optimizer.zero_grad()
 
@@ -1019,15 +1020,18 @@ def main(args_list=None, trial=None):
                         step=completed_steps,
                         log_kwargs={"wandb": {"commit": True}},
                     )
-                    if trial is not None:
+                    if trial is not None and step == len(train_dataloader) - 1:
                         if args.dataset_name == "custom:math_dataset":
                             metric = acc_val
                         else:
                             metric = perplexity
-                        trial.report(metric, completed_steps)
+                        trial.report(metric, epoch - 1)
                         if trial.should_prune():
+                            print(command_line)
+                            print("pruning", epoch - 1)
                             raise optuna.exceptions.TrialPruned()
                         if completed_steps >= args.max_train_steps - 2:
+                            accelerator.end_training()
                             return metric
                     total_loss = 0
                     num_loss = 0
