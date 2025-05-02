@@ -1,0 +1,17 @@
+imageio
+matplotlib
+tensorboard
+tensorboard-data-server
+tiktoken
+tokenizers
+torch 
+torchvision
+tqdm
+git+https://github.com/huggingface/transformers
+einops
+datasets
+requests
+evaluate
+accelerate
+wandb
+optuna
