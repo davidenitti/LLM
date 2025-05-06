@@ -102,8 +102,7 @@ class MathOperationsDataset(Dataset):
         for _ in range(self.steps2think):
             math_expression += f"="
         math_expression += f"{result}<eos>"
-        if len(math_expression) > self.padding:
-            # math_expression = math_expression[:self.padding]
+        if len(math_expression) >= self.padding:
             raise ValueError(f"Math expression too long: {math_expression}")
         out = self.tokenizer(
             math_expression, padding="max_length", max_length=self.padding, truncation=True, return_token_type_ids=False

@@ -90,13 +90,14 @@ def apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
 
     Args:
         x (torch.Tensor): Input tensor with positional embeddings to be applied. (B, H, T, C)
-        freqs_cis (torch.Tensor): Precomputed complex exponential values for positional embeddings.
+        freqs_cis (torch.Tensor): Precomputed complex exponential values for positional embeddings. (T,C/2)
 
     Returns:
         torch.Tensor: Tensor with rotary embeddings applied.
     """
     dtype = x.dtype
     assert x.dim() == 4, "x must be a 4D tensor"
+    freqs_cis = freqs_cis[:x.size(2), :]
     assert x.size(2) == freqs_cis.size(0), "x and freqs_cis must have the same sequence length"
     assert x.size(3) == freqs_cis.size(1)*2
     x = torch.view_as_complex(x.float().view(*x.shape[:-1], -1, 2))

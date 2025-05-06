@@ -38,7 +38,8 @@ from transformers.utils import check_min_version, send_example_telemetry
 from transformers.utils.versions import require_version
 from functools import partial
 
-from model import custom_config, custom_model, check_tensors
+from custom_func import custom_config, custom_model
+from checks import check_tensors
 
 check_min_version("4.50.0.dev0")
 
@@ -227,9 +228,6 @@ def parse_args(args_list):
         type=float,
         default=None,
         help="Value to clip the gradient norm to.",
-    )
-    parser.add_argument(
-        "--eval_mode_epoch", type=int, default=None, help="after such epoch the model is trained in eval mode"
     )
     parser.add_argument(
         "--save_checkpoint",
@@ -473,12 +471,14 @@ def main(args_list=None, trial=None):
             from math_dataset import MathOperationsDataset
 
             lm_datasets = {}
+            assert args.block_size is not None, "block_size must be set for math dataset"
             lm_datasets["train"] = MathOperationsDataset(
                 num_samples=2000000,
                 operations=["+", "-", "*", "/"],
                 min_number=0,
                 max_number=args.max_math_value,
                 steps2think=args.steps2think,
+                padding=args.block_size,
             )
             lm_datasets["validation"] = MathOperationsDataset(
                 num_samples=10000,
@@ -488,6 +488,7 @@ def main(args_list=None, trial=None):
                 max_number=args.max_math_value * 2,
                 tokenizer=lm_datasets["train"].tokenizer,
                 steps2think=args.steps2think,
+                padding=args.block_size,
             )
             tokenizer = lm_datasets["train"].tokenizer
         else:
@@ -875,13 +876,8 @@ def main(args_list=None, trial=None):
         total_loss_mini = 0
         num_loss_mini = 0
 
-    weight_decay_set = False
     for epoch in range(starting_epoch, args.num_train_epochs + 1):
-        if args.eval_mode_epoch is not None and epoch >= args.eval_mode_epoch:
-            model.eval()
-            print("EVAL MODE!")
-        else:
-            model.train()
+        model.train()
         if args.with_tracking:
             total_loss = 0
             num_loss = 0

@@ -40,33 +40,18 @@ class CustomGPTConfig(PretrainedConfig):
             Number of hidden layers in the Transformer encoder.
         n_head (`int`, *optional*, defaults to 12):
             Number of attention heads for each attention layer in the Transformer encoder.
-        n_inner (`int`, *optional*):
-            Dimensionality of the inner feed-forward layers. `None` will set it to 4 times n_embd
         activation_function (`str`, *optional*, defaults to `"gelu_new"`):
             Activation function, to be selected in the list `["relu", "silu", "gelu", "tanh", "gelu_new"]`.
-        resid_pdrop (`float`, *optional*, defaults to 0.1):
-            The dropout probability for all fully connected layers in the embeddings, encoder, and pooler.
-        embd_pdrop (`float`, *optional*, defaults to 0.1):
-            The dropout ratio for the embeddings.
-        attn_pdrop (`float`, *optional*, defaults to 0.1):
-            The dropout ratio for the attention.
+        dropout (`float`, *optional*, defaults to 0.1):
+            The dropout
         layer_norm_epsilon (`float`, *optional*, defaults to 1e-05):
             The epsilon to use in the layer normalization layers.
         initializer_range (`float`, *optional*, defaults to 0.02):
             The standard deviation of the truncated_normal_initializer for initializing all weight matrices.
-        scale_attn_weights (`bool`, *optional*, defaults to `True`):
-            Scale attention weights by dividing by sqrt(hidden_size)..
-        use_cache (`bool`, *optional*, defaults to `True`):
-            Whether or not the model should return the last key/values attentions (not used by all models).
         bos_token_id (`int`, *optional*, defaults to 50256):
             Id of the beginning of sentence token in the vocabulary.
         eos_token_id (`int`, *optional*, defaults to 50256):
             Id of the end of sentence token in the vocabulary.
-        scale_attn_by_inverse_layer_idx (`bool`, *optional*, defaults to `False`):
-            Whether to additionally scale attention weights by `1 / layer_idx + 1`.
-        reorder_and_upcast_attn (`bool`, *optional*, defaults to `False`):
-            Whether to scale keys (K) prior to computing attention (dot-product) and upcast attention
-            dot-product/softmax to float() when training with mixed precision.
 
     ```"""
 
@@ -88,19 +73,14 @@ class CustomGPTConfig(PretrainedConfig):
         n_layer=12,
         n_head=12,
         bias=True,
-        n_inner=None,
         activation_function="gelu_new",
-        dropout=0.1,
+        dropout=0.0,
         layer_norm_epsilon=1e-5,
         initializer_range=0.02,
-        scale_attn_weights=True,
-        use_cache=True,
         bos_token_id=50256,
         eos_token_id=50256,
-        scale_attn_by_inverse_layer_idx=False,
         selfatt_class="SelfAttention",
         selfatt_class_kwargs={},
-        random_weight_noise=0.0,
         megatron_init=True,
         norm_loss=0.0,
         rotary_emb=0,
@@ -109,7 +89,6 @@ class CustomGPTConfig(PretrainedConfig):
         self.rotary_emb = rotary_emb
         self.norm_loss = norm_loss
         self.megatron_init = megatron_init
-        self.random_weight_noise = random_weight_noise
         self.bias = bias
         self.selfatt_class = selfatt_class
         self.selfatt_class_kwargs = selfatt_class_kwargs
@@ -118,14 +97,10 @@ class CustomGPTConfig(PretrainedConfig):
         self.n_embd = n_embd
         self.n_layer = n_layer
         self.n_head = n_head
-        self.n_inner = n_inner
         self.activation_function = activation_function
         self.dropout = dropout
         self.layer_norm_epsilon = layer_norm_epsilon
         self.initializer_range = initializer_range
-        self.scale_attn_weights = scale_attn_weights
-        self.use_cache = use_cache
-        self.scale_attn_by_inverse_layer_idx = scale_attn_by_inverse_layer_idx
 
         self.bos_token_id = bos_token_id
         self.eos_token_id = eos_token_id
@@ -272,9 +247,6 @@ class CustomGPTmodel(PreTrainedModel):
         if attention_mask is not None:
             print("attention_mask used!!")
             print(attention_mask)
-        if self.config.random_weight_noise > 0 and self.training and random.random() < 0.01:
-            for p in self.parameters():
-                p.data += (torch.rand_like(p) < 0.001) * torch.randn_like(p) * self.config.random_weight_noise
         if inputs_embeds is None:
             inputs_embeds = self.word_emb(input_ids)
         else:
@@ -349,22 +321,3 @@ class CustomGPTmodel(PreTrainedModel):
             # append sampled index to the running sequence and continue
             idx = torch.cat((idx, idx_next), dim=1)
         return idx
-
-
-def custom_config(name_config):
-    if name_config == "custom:gptv0":
-        return CustomGPTConfig()
-    # elif name_config == "custom:rnnv0":
-    #     import rnn
-    #     return rnn.CustomRNNConfig()
-    else:
-        raise NotImplementedError()
-
-
-def custom_model(config):
-    if isinstance(config, CustomGPTConfig):
-        return CustomGPTmodel(config)
-    # elif isinstance(config, rnn.CustomRNNConfig):
-    #     return rnn.CustomRNNmodel(config)
-    else:
-        raise NotImplementedError()

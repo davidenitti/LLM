@@ -1,6 +1,8 @@
 from torch import nn
 import torch
 import torch.nn.functional as F
+import matplotlib.pyplot as plt
+
 class SoftGradHardTanhFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, input):
@@ -42,7 +44,6 @@ class SoftGradHardSigmoid(nn.Module):
 
 
 def vis(model):
-    import matplotlib.pyplot as plt
     input_tensor = torch.arange(-4, 4, 0.04, requires_grad=True)
     output = model(input_tensor)
     output_sum = output.sum()
@@ -56,6 +57,7 @@ def vis(model):
     plt.xlabel('Input Index')
     plt.ylabel('Gradient')
     plt.show()
+
 
 if __name__ == "__main__":
     vis(SoftGradHardTanh())
