@@ -18,7 +18,7 @@ import sys
 from einops import rearrange
 
 from blocks import SoftGradHardTanh, SoftGradHardSigmoid
-
+from utils import convert_string_format_to_json_like
 
 class RNNCell(nn.Module):
     def __init__(
@@ -219,7 +219,11 @@ class CustomRNNConfig(PretrainedConfig):
             update_str (`str`): String with attributes that should be updated for this class.
 
         """
-        d = json.loads("{" + update_str + "}")
+        if '"' not in update_str:
+            update_str = convert_string_format_to_json_like(update_str)
+        update_str = "{" + update_str + "}"
+        print(update_str)
+        d = json.loads(update_str)
         for k, v in d.items():
             if not hasattr(self, k):
                 raise ValueError(f"key {k} isn't in the original config dict")

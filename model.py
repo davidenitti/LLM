@@ -23,7 +23,7 @@ from blocks import SoftGradHardTanh, SoftGradHardSigmoid
 from torch.nn import GELU
 
 from basic_transformer import SelfAttention
-
+from utils import convert_string_format_to_json_like
 
 class CustomGPTConfig(PretrainedConfig):
     """
@@ -48,11 +48,6 @@ class CustomGPTConfig(PretrainedConfig):
             The epsilon to use in the layer normalization layers.
         initializer_range (`float`, *optional*, defaults to 0.02):
             The standard deviation of the truncated_normal_initializer for initializing all weight matrices.
-        bos_token_id (`int`, *optional*, defaults to 50256):
-            Id of the beginning of sentence token in the vocabulary.
-        eos_token_id (`int`, *optional*, defaults to 50256):
-            Id of the end of sentence token in the vocabulary.
-
     ```"""
 
     model_type = "custom_gptv0"
@@ -77,8 +72,6 @@ class CustomGPTConfig(PretrainedConfig):
         dropout=0.0,
         layer_norm_epsilon=1e-5,
         initializer_range=0.02,
-        bos_token_id=50256,
-        eos_token_id=50256,
         selfatt_class="SelfAttention",
         selfatt_class_kwargs={},
         megatron_init=True,
@@ -102,10 +95,7 @@ class CustomGPTConfig(PretrainedConfig):
         self.layer_norm_epsilon = layer_norm_epsilon
         self.initializer_range = initializer_range
 
-        self.bos_token_id = bos_token_id
-        self.eos_token_id = eos_token_id
-
-        super().__init__(bos_token_id=bos_token_id, eos_token_id=eos_token_id, **kwargs)
+        super().__init__(**kwargs)
 
     def update_from_string(self, update_str: str):
         """
@@ -119,8 +109,11 @@ class CustomGPTConfig(PretrainedConfig):
             update_str (`str`): String with attributes that should be updated for this class.
 
         """
-        print("{" + update_str + "}")
-        d = json.loads("{" + update_str + "}")
+        if '"' not in update_str:
+            update_str = convert_string_format_to_json_like(update_str)
+        update_str = "{" + update_str + "}"
+        print(update_str)
+        d = json.loads(update_str)
         for k, v in d.items():
             if not hasattr(self, k):
                 raise ValueError(f"key {k} isn't in the original config dict")
@@ -296,12 +289,14 @@ class CustomGPTmodel(PreTrainedModel):
         return self.word_emb
 
     @torch.no_grad()
-    def generate(self, idx, max_length, temperature=1.0, top_k=None):
+    def generate(self, idx, max_length, temperature=1.0, top_k=None, eos_token_id=None):
         """
         Take a conditioning sequence of indices idx (LongTensor of shape (b,t)) and complete
-        the sequence max_new_tokens times, feeding the predictions back into the model each time.
+        the sequence max_length times, feeding the predictions back into the model each time.
         Most likely you'll want to make sure to be in model.eval() mode of operation for this.
+        This is a naive implementation! for efficiency you would need to implement caching
         """
+        done = torch.zeros(idx.size(0), dtype=torch.bool, device=idx.device)
         for _ in range(max_length):
             # if the sequence context is growing too long we must crop it at block_size
             idx_cond = idx if idx.size(1) <= self.config.n_positions else idx[:, -self.config.n_positions :]
@@ -319,5 +314,11 @@ class CustomGPTmodel(PreTrainedModel):
             # sample from the distribution
             idx_next = torch.multinomial(probs, num_samples=1)
             # append sampled index to the running sequence and continue
+            
             idx = torch.cat((idx, idx_next), dim=1)
+            if eos_token_id is not None:
+                assert done.shape == idx_next.shape
+                done = done | (idx_next == eos_token_id)
+                if done.all():
+                    break
         return idx

@@ -99,11 +99,11 @@ def group_texts_val(examples, block_size, stride):
     return result
 
 
-def tokenize_function(examples, tokenizer, text_column_name, prepend_eos):
+def tokenize_function(examples, tokenizer, text_column_name, prepend_bos):
     tokens = tokenizer(examples[text_column_name])  # ,max_length=config.max_position_embeddings)
-    if prepend_eos:
+    if prepend_bos:
         for i in range(len(tokens["input_ids"])):
-            tokens["input_ids"][i] = [tokenizer.eos_token_id] + tokens["input_ids"][i]
+            tokens["input_ids"][i] = [tokenizer.bos_token_id] + tokens["input_ids"][i]
     return tokens
 
 
@@ -373,11 +373,11 @@ def main(args_list=None, trial=None):
 
     args = parse_args(args_list)
     if args.dataset_name == "Skylion007/openwebtext":
-        prepend_eos = True
+        prepend_bos = True
         args.dataset_config_name = ""
     else:
         # for "Salesforce/wikitext" prepend is not a good idea, because often consecutive texts are of the same sentence.
-        prepend_eos = False
+        prepend_bos = False
     if args.wait:
         wait_until_gpu_memory_free(min_free_memory=args.per_device_train_batch_size * 1300 + 1500, check_interval=100)
 
@@ -622,7 +622,7 @@ def main(args_list=None, trial=None):
         if not custom_dataset:
             tokenized_datasets = raw_datasets.map(
                 partial(
-                    tokenize_function, tokenizer=tokenizer, text_column_name=text_column_name, prepend_eos=prepend_eos
+                    tokenize_function, tokenizer=tokenizer, text_column_name=text_column_name, prepend_bos=prepend_bos
                 ),
                 batched=True,
                 num_proc=args.preprocessing_num_workers,
@@ -753,15 +753,7 @@ def main(args_list=None, trial=None):
         args.max_train_steps if overrode_max_train_steps else args.max_train_steps * accelerator.num_processes
     )
     if "_mod" in args.lr_scheduler_type:
-        import scheduler
-
-        lr_scheduler = getattr(scheduler, args.lr_scheduler_type)(
-            optimizer=optimizer,
-            num_warmup_steps=args.num_warmup_steps * accelerator.num_processes,
-            num_training_steps=int(num_training_steps * (1.0 - args.ratio_min_learning_rate)),
-            min_lr=args.min_learning_rate,
-            log_every=300 * args.gradient_accumulation_steps,
-        )
+        raise NotImplementedError()
     else:
         if "min_lr" in args.lr_scheduler_type:
             scheduler_specific_kwargs = {"min_lr": args.min_learning_rate}
@@ -1090,17 +1082,13 @@ def generate(model, tokenizer, prompt="Once upon a time in a faraway land,", tem
     model.eval()
     input_ids = tokenizer.encode(prompt, return_tensors="pt")
     input_ids = input_ids.to("cuda")
-    # Generate text
-    output = model.generate(input_ids, max_length=100, temperature=temperature)
     if stop_at_eos:
         eos_token_id = tokenizer.eos_token_id
-        if eos_token_id is not None:
-            try:
-                output = output[:, : output[0].tolist().index(eos_token_id) + 1]
-            except ValueError:
-                pass
-    generated_text = tokenizer.decode(output[0], skip_special_tokens=True)
-    # Print the generated text
+    else:
+        eos_token_id = None
+    output = model.generate(input_ids, max_length=100, temperature=temperature, eos_token_id=eos_token_id)
+
+    generated_text = tokenizer.decode(output[0])  # , skip_special_tokens=True)
     print(generated_text)
     model.train()
 
