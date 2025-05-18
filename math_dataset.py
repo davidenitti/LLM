@@ -21,7 +21,7 @@ def get_tokenizer():
     tokenizer.pre_tokenizer = pre_tokenizers.Split(pattern="", behavior="isolated")
     tokenizer.decoder = decoders.Replace("", "")  # No-op, char-level
     char_tokenizer = PreTrainedTokenizerFast(tokenizer_object=tokenizer)
-    char_tokenizer.add_special_tokens({"unk_token": "<unk>", "pad_token": "<pad>", "eos_token": "<eos>"})
+    char_tokenizer.add_special_tokens({"unk_token": "<unk>", "pad_token": "<pad>", "eos_token": "<eos>", "bos_token":"<bos>"})
     return char_tokenizer
 
 def tokenizer_math(text):
@@ -98,15 +98,15 @@ class MathOperationsDataset(Dataset):
         except ZeroDivisionError:
             result = "N"
         # Create the string representation
-        math_expression = f"{number1}{operation}{number2}"
+        math_expression = f"<bos>{number1}{operation}{number2}"
         for _ in range(self.steps2think):
             math_expression += f"="
         math_expression += f"{result}<eos>"
-        if len(math_expression) >= self.padding:
-            raise ValueError(f"Math expression too long: {math_expression}")
         out = self.tokenizer(
-            math_expression, padding="max_length", max_length=self.padding, truncation=True, return_token_type_ids=False
+            math_expression, padding="max_length", max_length=self.padding, truncation=False, return_token_type_ids=False
         )
+        if len(out["input_ids"]) > self.padding:
+            raise ValueError(f"Math expression too long: {math_expression} {len(out['input_ids'])}>= {self.padding}")
         out["labels"] = out["input_ids"].copy()
         found_start_label = False
         for i in range(len(out["labels"])):

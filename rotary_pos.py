@@ -14,6 +14,7 @@ def precompute_freqs(
     rope_factor=40,
 ) -> torch.Tensor:
     dim = qk_rope_dim
+    assert dim % 2 == 0
     seqlen = max_seq_len
     beta_fast = beta_fast
     beta_slow = beta_slow
@@ -100,7 +101,7 @@ def apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
     freqs_cis = freqs_cis[:x.size(2), :]
     assert x.size(2) == freqs_cis.size(0), "x and freqs_cis must have the same sequence length"
     assert x.size(3) == freqs_cis.size(1)*2
-    x = torch.view_as_complex(x.float().view(*x.shape[:-1], -1, 2))
+    x = torch.view_as_complex(x.float().contiguous().view(*x.shape[:-1], -1, 2))
     freqs_cis = freqs_cis.view(1, 1, x.size(2), x.size(-1))
     y = torch.view_as_real(x * freqs_cis).flatten(3)
     return y.to(dtype)

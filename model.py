@@ -23,7 +23,12 @@ from blocks import SoftGradHardTanh, SoftGradHardSigmoid
 from torch.nn import GELU
 
 from basic_transformer import SelfAttention
+try:
+    from new_transformers import SelfAttentionCumSumV3, SelfAttentionCumSumV2
+except:
+    pass
 from utils import convert_string_format_to_json_like
+
 
 class CustomGPTConfig(PretrainedConfig):
     """
@@ -126,6 +131,8 @@ def update_dict(d, d2):
 
 
 class CustomGPTmodel(PreTrainedModel):
+    config_class = CustomGPTConfig
+
     def __init__(self, config):
         super().__init__(config)
         self.config = config
@@ -296,7 +303,7 @@ class CustomGPTmodel(PreTrainedModel):
         Most likely you'll want to make sure to be in model.eval() mode of operation for this.
         This is a naive implementation! for efficiency you would need to implement caching
         """
-        done = torch.zeros(idx.size(0), dtype=torch.bool, device=idx.device)
+        done = torch.zeros((idx.size(0), 1), dtype=torch.bool, device=idx.device)
         for _ in range(max_length):
             # if the sequence context is growing too long we must crop it at block_size
             idx_cond = idx if idx.size(1) <= self.config.n_positions else idx[:, -self.config.n_positions :]
@@ -314,10 +321,10 @@ class CustomGPTmodel(PreTrainedModel):
             # sample from the distribution
             idx_next = torch.multinomial(probs, num_samples=1)
             # append sampled index to the running sequence and continue
-            
+
             idx = torch.cat((idx, idx_next), dim=1)
             if eos_token_id is not None:
-                assert done.shape == idx_next.shape
+                assert done.shape == idx_next.shape, f"{done.shape} != {idx_next.shape}"
                 done = done | (idx_next == eos_token_id)
                 if done.all():
                     break

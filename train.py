@@ -40,6 +40,7 @@ from functools import partial
 
 from custom_func import custom_config, custom_model
 from checks import check_tensors
+from inference import generate
 
 check_min_version("4.50.0.dev0")
 
@@ -165,6 +166,14 @@ def parse_args(args_list):
             " the training time."
         ),
     )
+    parser.add_argument("--detach_every", type=int, default=None, help="detach every N steps")
+    parser.add_argument("--reset_instead_detach", action="store_true", help="reset instead of detach")
+    parser.add_argument(
+        "--reset_prob",
+        type=float,
+        default=-1.0,
+        help="multiple of 1/mini_steps to compute the probability to reset for rnn models",
+    )
     parser.add_argument(
         "--per_device_train_batch_size",
         type=int,
@@ -287,7 +296,7 @@ def parse_args(args_list):
         help="maximum value for the math operations dataset in the training set",
     )
 
-    parser.add_argument("--wait", action="store_true", help="wait for GPU")
+    parser.add_argument("--wait", type=int, default=None, help="Gb free to wait for GPU")
     parser.add_argument(
         "--overwrite_cache", action="store_true", help="Overwrite the cached training and evaluation sets"
     )
@@ -378,8 +387,8 @@ def main(args_list=None, trial=None):
     else:
         # for "Salesforce/wikitext" prepend is not a good idea, because often consecutive texts are of the same sentence.
         prepend_bos = False
-    if args.wait:
-        wait_until_gpu_memory_free(min_free_memory=args.per_device_train_batch_size * 1300 + 1500, check_interval=100)
+    if args.wait is not None:
+        wait_until_gpu_memory_free(min_free_memory=args.wait * 1000, check_interval=100)
 
     # Initialize the accelerator. We will let the accelerator handle device placement for us in this example.
     # If we're using tracking, we also need to initialize it here and it will by default pick up all supported trackers
@@ -392,7 +401,8 @@ def main(args_list=None, trial=None):
     config_overrides_str = config_overrides_str.replace('"selfatt_class_kwargs"', "att_args")
     config_overrides_str = config_overrides_str.replace('"', "").replace("'", "")
     run_name = f"{args.name_exp} b{args.per_device_train_batch_size*args.gradient_accumulation_steps} lr{args.learning_rate} {config_name}{config_overrides_str}"
-
+    if args.detach_every is not None:
+        run_name += f" detach{args.detach_every}"
     if args.weight_decay > 0:
         run_name += f" wd{args.weight_decay}"
 
@@ -473,7 +483,7 @@ def main(args_list=None, trial=None):
             lm_datasets = {}
             assert args.block_size is not None, "block_size must be set for math dataset"
             lm_datasets["train"] = MathOperationsDataset(
-                num_samples=2000000,
+                num_samples=5000000,
                 operations=["+", "-", "*", "/"],
                 min_number=0,
                 max_number=args.max_math_value,
@@ -481,7 +491,7 @@ def main(args_list=None, trial=None):
                 padding=args.block_size,
             )
             lm_datasets["validation"] = MathOperationsDataset(
-                num_samples=10000,
+                num_samples=20000,
                 operations=["+", "-", "*", "/"],
                 min_number=0,
                 max_train_number=args.max_math_value,
@@ -752,6 +762,8 @@ def main(args_list=None, trial=None):
     num_training_steps = (
         args.max_train_steps if overrode_max_train_steps else args.max_train_steps * accelerator.num_processes
     )
+    if args.detach_every is not None:
+        num_training_steps *= block_size // (args.detach_every // 2)  # FIXME
     if "_mod" in args.lr_scheduler_type:
         raise NotImplementedError()
     else:
@@ -783,6 +795,8 @@ def main(args_list=None, trial=None):
 
     # We need to recalculate our total training steps as the size of the training dataloader may have changed.
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
+    if args.detach_every is not None:
+        num_update_steps_per_epoch *= block_size // (args.detach_every // 2)  # FIXME
     if overrode_max_train_steps:
         args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
     # Afterwards we recalculate our number of training epochs
@@ -867,7 +881,7 @@ def main(args_list=None, trial=None):
     if args.with_tracking:
         total_loss_mini = 0
         num_loss_mini = 0
-
+    hidden_state = None
     for epoch in range(starting_epoch, args.num_train_epochs + 1):
         model.train()
         if args.with_tracking:
@@ -878,153 +892,190 @@ def main(args_list=None, trial=None):
             active_dataloader = accelerator.skip_first_batches(train_dataloader, resume_step)
         else:
             active_dataloader = train_dataloader
-
-        for step, batch in enumerate(active_dataloader):
+        for orig_step, orig_batch in enumerate(active_dataloader):
             # print(batch["input_ids"][0])
             # print(tokenizer.decode(batch["input_ids"][0]))
             # print(batch["labels"][0])
-
-            with accelerator.accumulate(model):
-                outputs = model(**batch)
-                loss = outputs.loss
-                if torch.isnan(loss).any():
-                    print("Loss contains NaN values!")
-                    check_tensors(outputs.logits, "logits")
-                    accelerator.free_memory()  # Free memory before exiting
-                    exit()
-                # We keep track of the loss at each epoch
-                if args.with_tracking:
-                    total_loss += loss.detach().float()
-                    total_loss_mini += loss.detach().float()
-                    num_loss += 1
-                    num_loss_mini += 1
-                    if (step + 1) % (args.log_every_steps // 8 * args.gradient_accumulation_steps) == 0:
-                        print(
-                            f"step {completed_steps+1} loss {total_loss.detach().item() / num_loss:.2f} {loss.detach().item():.2f}"
-                        )
-                accelerator.backward(loss)
-                if accelerator.sync_gradients and args.grad_clip_value is not None:
-                    # TODO TO CHECK IF IT'S CORRECT
-                    accelerator.clip_grad_norm_(model.parameters(), max_norm=args.grad_clip_value)
-                #     for name, param in model.named_parameters():
-                #         if param.grad is not None and param.grad.norm().item() > 1:
-                #             print(completed_steps,name, param.grad.norm().item())
-                optimizer.step()
-                # if isinstance(lr_scheduler.scheduler, scheduler.ReduceLROnPlateau_mod):
-                #     lr_scheduler.scheduler.update(loss.detach().float().item(), step)
-                lr_scheduler.step()
-                optimizer.zero_grad()
-
-            # Checks if the accelerator has performed an optimization step behind the scenes
-            if accelerator.sync_gradients:
-                progress_bar.update(1)
-                completed_steps += 1
-                if (
-                    completed_steps % 100 == 0
-                    and step != len(train_dataloader) - 1
-                    and ((step + 1) % (args.log_every_steps * args.gradient_accumulation_steps) != 0)
-                    and args.with_tracking
-                ):
-                    accelerator.log(
-                        {
-                            "train_loss_100steps": total_loss_mini.detach().item() / num_loss_mini,
-                            "lr0": lr_scheduler.get_lr()[0],
-                        },
-                        step=completed_steps,
-                        log_kwargs={"wandb": {"commit": True}},
-                    )
-                    total_loss_mini = 0
-                    num_loss_mini = 0
-
-            if isinstance(checkpointing_steps, int):
-                if completed_steps % checkpointing_steps == 0 and accelerator.sync_gradients:
-                    output_dir = f"step_{completed_steps}"
-                    if args.output_dir is not None:
-                        output_dir = os.path.join(args.output_dir, output_dir)
-                    accelerator.save_state(output_dir)
-            if ((step + 1) % (args.log_every_steps * args.gradient_accumulation_steps) == 0) or (
-                step == len(train_dataloader) - 1
-            ):
-                eval_loss, perplexity = compute_val(
-                    model, eval_dataloader, accelerator, args.per_device_eval_batch_size
-                )
-                if eval_dataloader_stride is not None:
-                    eval_loss_stride, perplexity_stride = compute_val(
-                        model, eval_dataloader_stride, accelerator, args.per_device_eval_batch_size
-                    )
+            if args.detach_every is not None:
+                detach_size = min(args.detach_every, (completed_steps // 500 + 2))
+                num_mini_steps = orig_batch["input_ids"].shape[1] // detach_size
+                while detach_size * num_mini_steps < orig_batch["input_ids"].shape[1]:
+                    detach_size -= 1
+                    num_mini_steps = orig_batch["input_ids"].shape[1] // detach_size
+                    detach_size = orig_batch["input_ids"].shape[1] // num_mini_steps
+                    num_mini_steps = orig_batch["input_ids"].shape[1] // detach_size
+                assert orig_batch["input_ids"].shape[1] % detach_size == 0, f"{num_mini_steps} {detach_size}"
+            else:
+                detach_size = orig_batch["input_ids"].shape[1]
+            num_mini_steps = orig_batch["input_ids"].shape[1] // detach_size
+            hidden_state = None
+            for mini_step in range(num_mini_steps):
+                if num_mini_steps == 1:
+                    batch = orig_batch
+                    step = orig_step
                 else:
-                    eval_loss_stride = None
-                    perplexity_stride = None
-                if args.dataset_name == "custom:math_dataset":
-                    acc_val, acc_dict_val = compute_acc_math(model, eval_dataloader, tokenizer)
-                    # FIXME! using again the train_dataloader! is this ok??
-                    acc_train, acc_dict_train = compute_acc_math(model, train_dataloader, tokenizer)
-                    print(f"Accuracy train: {acc_train*100:.1f}%")
-                    for op in acc_dict_train:
-                        print(f"Accuracy train {op}: {acc_dict_train[op]*100:.1f}%")
-
-                    print(f"Accuracy val: {acc_val*100:.1f}%")
-                    for op in acc_dict_val:
-                        print(f"Accuracy val {op}: {acc_dict_val[op]*100:.1f}%")
-
-                print(command_line)
-                print(run_name)
-                if args.dataset_name == "custom:math_dataset":
-                    equal = "=" * args.steps2think
-                    generate(model, tokenizer, "121+4" + equal, 0.1)
-                    generate(model, tokenizer, "12-2" + equal, 0.1)
-                    generate(model, tokenizer, "7*2" + equal, 0.1)
-                    generate(model, tokenizer, "5021+5" + equal, 0.1)
-                    generate(model, tokenizer, "5010-7" + equal, 0.1)
-                else:
-                    generate(model, tokenizer)
-                    generate(model, tokenizer, "There are")
-                    generate(model, tokenizer, "was born")
-                logger.info(
-                    f"epoch {epoch}:{(step+1)//args.gradient_accumulation_steps}: perplexity: {perplexity} eval_loss: {eval_loss}"
-                    f"\nperplexity_stride: {perplexity_stride} eval_loss_stride: {eval_loss_stride}"
-                )
-
-                if args.with_tracking:
-                    log = {
-                        "perplexity": perplexity,
-                        "eval_loss": eval_loss,
-                        "perplexity_stride": perplexity_stride,
-                        "eval_loss_stride": eval_loss_stride,
-                        "train_loss": total_loss.detach().item() / num_loss,
-                        "epoch": epoch,
-                        "lr0": lr_scheduler.get_lr()[0],
-                    }
-                    if args.dataset_name == "custom:math_dataset":
-                        log["acc_val"] = acc_val
-                        log["acc_train"] = acc_train
-                        dict_str_ops = {"+": "add", "-": "sub", "*": "mul", "/": "div"}
-
-                        for op in acc_dict_val:
-                            log[f"acc_val_{dict_str_ops[op]}"] = acc_dict_val[op]
-                            log[f"acc_train_{dict_str_ops[op]}"] = acc_dict_train[op]
-                    accelerator.log(
-                        log,
-                        step=completed_steps,
-                        log_kwargs={"wandb": {"commit": True}},
-                    )
-                    if trial is not None and step == len(train_dataloader) - 1:
-                        if args.dataset_name == "custom:math_dataset":
-                            metric = acc_val
+                    step = orig_step - 1 + (mini_step + 1) / num_mini_steps
+                    batch = {}
+                    for k in orig_batch:
+                        if orig_batch[k] is None:
+                            batch[k] = None
                         else:
-                            metric = perplexity
-                        trial.report(metric, epoch - 1)
-                        if trial.should_prune():
-                            print(command_line)
-                            print("pruning", epoch - 1)
-                            raise optuna.exceptions.TrialPruned()
-                        if completed_steps >= args.max_train_steps - 2:
-                            accelerator.end_training()
-                            return metric
-                    total_loss = 0
-                    num_loss = 0
-            if completed_steps >= args.max_train_steps:
-                break
+                            batch[k] = orig_batch[k][:, mini_step * detach_size : (mini_step + 1) * detach_size]
+                            # print(k,batch[k].shape,orig_batch[k].shape)
+                    if args.reset_prob > 0 and random.random() < args.reset_prob / num_mini_steps:
+                        batch["hidden"] = None
+                    else:
+                        batch["hidden"] = hidden_state if not args.reset_instead_detach else None
+                with accelerator.accumulate(model):
+                    outputs = model(**batch)
+                    hidden_state = outputs.hidden_states
+                    loss = outputs.loss
+                    if torch.isnan(loss).any():
+                        print("Loss contains NaN values!")
+                        check_tensors(outputs.logits, "logits")
+                        accelerator.free_memory()  # Free memory before exiting
+                        exit()
+                    # We keep track of the loss at each epoch
+                    if args.with_tracking:
+                        total_loss += loss.detach().float()
+                        total_loss_mini += loss.detach().float()
+                        num_loss += 1
+                        num_loss_mini += 1
+                        if (step + 1) % (args.log_every_steps // 8 * args.gradient_accumulation_steps) == 0:
+                            print(
+                                f"step {completed_steps+1} loss {total_loss.detach().item() / num_loss:.2f} {loss.detach().item():.2f}"
+                            )
+                    accelerator.backward(loss)
+                    if accelerator.sync_gradients and args.grad_clip_value is not None:
+                        # TODO TO CHECK IF IT'S CORRECT
+                        accelerator.clip_grad_norm_(model.parameters(), max_norm=args.grad_clip_value)
+                    #     for name, param in model.named_parameters():
+                    #         if param.grad is not None and param.grad.norm().item() > 1:
+                    #             print(completed_steps,name, param.grad.norm().item())
+                    optimizer.step()
+                    lr_scheduler.step()
+                    optimizer.zero_grad()
+
+                # Checks if the accelerator has performed an optimization step behind the scenes
+                if accelerator.sync_gradients:
+                    progress_bar.update(1)
+                    completed_steps += 1
+                    if (
+                        completed_steps % 100 == 0
+                        and step != len(train_dataloader) - 1
+                        and ((step + 1) % (args.log_every_steps * args.gradient_accumulation_steps) != 0)
+                        and args.with_tracking
+                    ):
+                        if num_mini_steps > 1:
+                            print("detach_size", detach_size, "num_mini_steps", num_mini_steps)
+                        accelerator.log(
+                            {
+                                "train_loss_100steps": total_loss_mini.detach().item() / num_loss_mini,
+                                "lr0": lr_scheduler.get_lr()[0],
+                            },
+                            step=completed_steps,
+                            log_kwargs={"wandb": {"commit": True}},
+                        )
+                        total_loss_mini = 0
+                        num_loss_mini = 0
+
+                if isinstance(checkpointing_steps, int):
+                    if completed_steps % checkpointing_steps == 0 and accelerator.sync_gradients:
+                        output_dir = f"step_{completed_steps}"
+                        if args.output_dir is not None:
+                            output_dir = os.path.join(args.output_dir, output_dir)
+                        accelerator.save_state(output_dir)
+                if ((step + 1) % (args.log_every_steps * args.gradient_accumulation_steps) == 0) or (
+                    step == len(train_dataloader) - 1
+                ):
+                    eval_loss, perplexity = compute_val(
+                        model, eval_dataloader, accelerator, args.per_device_eval_batch_size, args.detach_every
+                    )
+                    if eval_dataloader_stride is not None:
+                        eval_loss_stride, perplexity_stride = compute_val(
+                            model,
+                            eval_dataloader_stride,
+                            accelerator,
+                            args.per_device_eval_batch_size,
+                            args.detach_every,
+                        )
+                    else:
+                        eval_loss_stride = None
+                        perplexity_stride = None
+                    if args.dataset_name == "custom:math_dataset":
+                        acc_val, acc_dict_val = compute_acc_math(model, eval_dataloader, tokenizer)
+                        # FIXME! using again the train_dataloader! is this ok??
+                        acc_train, acc_dict_train = compute_acc_math(model, train_dataloader, tokenizer)
+                        print(f"Accuracy train: {acc_train*100:.1f}%")
+                        for op in acc_dict_train:
+                            print(f"Accuracy train {op}: {acc_dict_train[op]*100:.1f}%")
+
+                        print(f"Accuracy val: {acc_val*100:.1f}%")
+                        for op in acc_dict_val:
+                            print(f"Accuracy val {op}: {acc_dict_val[op]*100:.1f}%")
+
+                    print(command_line)
+                    print(run_name)
+                    if args.dataset_name == "custom:math_dataset":
+                        equal = "=" * args.steps2think
+                        generate(model, tokenizer, "<bos>121+4" + equal, 0.1, top_k=1)
+                        generate(model, tokenizer, "<bos>12-2" + equal, 0.1, top_k=1)
+                        generate(model, tokenizer, "<bos>7*2" + equal, 0.1, top_k=1)
+                        generate(model, tokenizer, "<bos>5021+5" + equal, 0.1, top_k=1)
+                        generate(model, tokenizer, "<bos>5010-7" + equal, 0.1, top_k=1)
+                    else:
+                        generate(model, tokenizer)
+                        generate(model, tokenizer, "There are")
+                        generate(model, tokenizer, "was born")
+                    logger.info(
+                        f"epoch {epoch}:{(step+1)//args.gradient_accumulation_steps}: perplexity: {perplexity} eval_loss: {eval_loss}"
+                        f"\nperplexity_stride: {perplexity_stride} eval_loss_stride: {eval_loss_stride}"
+                    )
+
+                    if args.with_tracking:
+                        log = {
+                            "perplexity": perplexity,
+                            "eval_loss": eval_loss,
+                            "perplexity_stride": perplexity_stride,
+                            "eval_loss_stride": eval_loss_stride,
+                            "train_loss": total_loss.detach().item() / num_loss,
+                            "epoch": epoch,
+                            "lr0": lr_scheduler.get_lr()[0],
+                        }
+                        if args.dataset_name == "custom:math_dataset":
+                            log["acc_val"] = acc_val
+                            log["acc_train"] = acc_train
+                            dict_str_ops = {"+": "add", "-": "sub", "*": "mul", "/": "div"}
+
+                            for op in acc_dict_val:
+                                log[f"acc_val_{dict_str_ops[op]}"] = acc_dict_val[op]
+                                log[f"acc_train_{dict_str_ops[op]}"] = acc_dict_train[op]
+                        accelerator.log(
+                            log,
+                            step=completed_steps,
+                            log_kwargs={"wandb": {"commit": True}},
+                        )
+                        if trial is not None and step == len(train_dataloader) - 1:
+                            prune = False
+                            if args.dataset_name == "custom:math_dataset":
+                                metric = acc_val
+                                if epoch > 15 and acc_val < 0.22:
+                                    prune = True
+                            else:
+                                metric = perplexity
+                            trial.report(metric, epoch - 1)
+                            if trial.should_prune() or perplexity > 300 or prune:
+                                print(command_line)
+                                print("pruning", epoch - 1)
+                                accelerator.end_training()
+                                raise optuna.exceptions.TrialPruned()
+                            if completed_steps >= args.max_train_steps - 2:
+                                accelerator.end_training()
+                                return metric
+                        total_loss = 0
+                        num_loss = 0
+                if completed_steps >= args.max_train_steps:
+                    break
 
         if args.push_to_hub and epoch < args.num_train_epochs:
             accelerator.wait_for_everyone()
@@ -1078,41 +1129,45 @@ def main(args_list=None, trial=None):
     return perplexity
 
 
-def generate(model, tokenizer, prompt="Once upon a time in a faraway land,", temperature=0.7, stop_at_eos=True):
-    model.eval()
-    input_ids = tokenizer.encode(prompt, return_tensors="pt")
-    input_ids = input_ids.to("cuda")
-    if stop_at_eos:
-        eos_token_id = tokenizer.eos_token_id
-    else:
-        eos_token_id = None
-    output = model.generate(input_ids, max_length=100, temperature=temperature, eos_token_id=eos_token_id)
-
-    generated_text = tokenizer.decode(output[0])  # , skip_special_tokens=True)
-    print(generated_text)
-    model.train()
-
-
-def compute_val(model, eval_dataloader, accelerator, per_device_eval_batch_size, generalized=True):
+def compute_val(model, eval_dataloader, accelerator, per_device_eval_batch_size, detach_every, generalized=True):
     model.eval()
     losses = []
     if generalized:
         losses_generalized = []
         valid_values = 0
-    for step, batch in enumerate(eval_dataloader):
-        with torch.no_grad():
-            outputs = model(**batch)
+    for step, orig_batch in enumerate(eval_dataloader):
+        if detach_every is not None:
+            detach_size = detach_every
+            assert orig_batch["input_ids"].shape[1] % detach_size == 0
+        else:
+            detach_size = orig_batch["input_ids"].shape[1]
+        num_mini_steps = orig_batch["input_ids"].shape[1] // detach_size
+        hidden_state = None
+        for mini_step in range(num_mini_steps):
+            if num_mini_steps == 1:
+                batch = orig_batch
+            else:
+                batch = {}
+                for k in orig_batch:
+                    if orig_batch[k] is None:
+                        batch[k] = None
+                    else:
+                        batch[k] = orig_batch[k][:, mini_step * detach_size : (mini_step + 1) * detach_size]
+                batch["hidden"] = hidden_state
+            with torch.no_grad():
+                outputs = model(**batch)
+                hidden_state = outputs.hidden_states
 
-        loss = outputs.loss
-        loss = accelerator.gather_for_metrics(loss.repeat(per_device_eval_batch_size)).double()
-        losses.append(loss)
-        if generalized:
-            # we remove the last element (batch size in total) because labels are not shifted
-            num_valid_labels = (batch["labels"] != -100).sum() - batch["labels"].size(0)
-            # not sure this is correct with multiple GPUs
-            num_valid_labels = accelerator.gather_for_metrics(num_valid_labels)
-            valid_values += num_valid_labels.sum()
-            losses_generalized.append(loss.mean().view(-1) * num_valid_labels)
+            loss = outputs.loss
+            loss = accelerator.gather_for_metrics(loss.repeat(per_device_eval_batch_size)).double()
+            losses.append(loss)
+            if generalized:
+                # we remove the last element (batch size in total) because labels are not shifted
+                num_valid_labels = (batch["labels"] != -100).sum() - batch["labels"].size(0)
+                # not sure this is correct with multiple GPUs
+                num_valid_labels = accelerator.gather_for_metrics(num_valid_labels)
+                valid_values += num_valid_labels.sum()
+                losses_generalized.append(loss.mean().view(-1) * num_valid_labels)
 
     losses = torch.cat(losses)
     if generalized:
@@ -1136,8 +1191,7 @@ def compute_val(model, eval_dataloader, accelerator, per_device_eval_batch_size,
         return eval_loss, perplexity
 
 
-def compute_acc_math(model, eval_dataloader, tokenizer, max_data=10000):
-    debug = False
+def compute_acc_math(model, eval_dataloader, tokenizer, max_data=10000, debug=True):
     model.eval()
     sum_acc = 0
     acc_num = 0
@@ -1180,7 +1234,7 @@ def compute_acc_math(model, eval_dataloader, tokenizer, max_data=10000):
                 predicted_tokens[gt == -100] = tokenizer.pad_token_id
                 gt[gt == -100] = tokenizer.pad_token_id
                 for b in range(len(batch["input_ids"])):
-                    if tokenizer.decode(batch["input_ids"][b], skip_special_tokens=True) in ["12-2=10", "7*2=14"]:
+                    if step==1 or tokenizer.decode(batch["input_ids"][b], skip_special_tokens=True) in ["12-2=10", "7*2=14", "121+4=125","10+2=12"]:
                         print("input", tokenizer.decode(batch["input_ids"][b], skip_special_tokens=True))
                         print("predicted", tokenizer.decode(predicted_tokens[b], skip_special_tokens=True))
                         print("gt", tokenizer.decode(gt[b], skip_special_tokens=True))
