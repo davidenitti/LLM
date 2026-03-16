@@ -3,6 +3,7 @@ import time
 import random
 import traceback
 
+
 def wait_until_gpu_free(gpu_id=0, threshold=20, check_interval=60):
     """
     Waits until the GPU usage drops below the specified threshold.
@@ -15,9 +16,13 @@ def wait_until_gpu_free(gpu_id=0, threshold=20, check_interval=60):
         try:
             # Run nvidia-smi command and get the GPU utilization
             result = subprocess.run(
-                ["nvidia-smi", "--query-gpu=utilization.gpu", "--format=csv,noheader,nounits"],
+                [
+                    "nvidia-smi",
+                    "--query-gpu=utilization.gpu",
+                    "--format=csv,noheader,nounits",
+                ],
                 capture_output=True,
-                text=True
+                text=True,
             )
             utilization = int(result.stdout.split("\n")[gpu_id].strip())
 
@@ -27,13 +32,13 @@ def wait_until_gpu_free(gpu_id=0, threshold=20, check_interval=60):
                 break
 
             print(f"GPU {gpu_id} busy (Utilization: {utilization}%), waiting...")
-            time.sleep(check_interval//2 + random.randint(1,check_interval//2))
-        
+            time.sleep(check_interval // 2 + random.randint(1, check_interval // 2))
+
         except Exception as e:
             print(f"Error checking GPU status: {e}")
             traceback.print_exc()
             print(result.stdout)
-            time.sleep(check_interval//2 + random.randint(1,check_interval//2))
+            time.sleep(check_interval // 2 + random.randint(1, check_interval // 2))
 
 
 def wait_until_gpu_memory_free(gpu_id=0, min_free_memory=4000, check_interval=60):
@@ -48,9 +53,13 @@ def wait_until_gpu_memory_free(gpu_id=0, min_free_memory=4000, check_interval=60
         try:
             # Run nvidia-smi command to get free memory
             result = subprocess.run(
-                ["nvidia-smi", "--query-gpu=memory.free", "--format=csv,noheader,nounits"],
+                [
+                    "nvidia-smi",
+                    "--query-gpu=memory.free",
+                    "--format=csv,noheader,nounits",
+                ],
                 capture_output=True,
-                text=True
+                text=True,
             )
             free_memory = int(result.stdout.split("\n")[gpu_id].strip())
 
@@ -59,15 +68,18 @@ def wait_until_gpu_memory_free(gpu_id=0, min_free_memory=4000, check_interval=60
                 print(f"GPU {gpu_id} is free (Free Memory: {free_memory} MB)")
                 break
 
-            print(f"GPU {gpu_id} busy (Free Memory: {free_memory} MB), needed {min_free_memory} MB waiting...")
-            time.sleep(check_interval//2 + random.randint(1,check_interval//2))
+            print(
+                f"GPU {gpu_id} busy (Free Memory: {free_memory} MB), needed {min_free_memory} MB waiting..."
+            )
+            time.sleep(check_interval // 2 + random.randint(1, check_interval // 2))
 
         except Exception as e:
             print(f"Error checking GPU memory status: {e}")
             traceback.print_exc()
             print(result.stdout)
-            time.sleep(check_interval//2 + random.randint(1,check_interval//2))
+            time.sleep(check_interval // 2 + random.randint(1, check_interval // 2))
+
 
 if __name__ == "__main__":
     wait_until_gpu_free()
-    wait_until_gpu_memory_free(min_free_memory=6*1200)
+    wait_until_gpu_memory_free(min_free_memory=6 * 1200)

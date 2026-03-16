@@ -1,0 +1,140 @@
+{
+  "version": "1.0",
+  "truncation": null,
+  "padding": null,
+  "added_tokens": [
+    {
+      "id": 0,
+      "content": "[UNK]",
+      "single_word": false,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": true
+    },
+    {
+      "id": 1,
+      "content": "[BOS]",
+      "single_word": false,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": true
+    },
+    {
+      "id": 2,
+      "content": "[EOS]",
+      "single_word": false,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": true
+    },
+    {
+      "id": 3,
+      "content": "[PAD]",
+      "single_word": false,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": true
+    }
+  ],
+  "normalizer": null,
+  "pre_tokenizer": {
+    "type": "Split",
+    "pattern": {
+      "String": ""
+    },
+    "behavior": "Isolated",
+    "invert": false
+  },
+  "post_processor": null,
+  "decoder": {
+    "type": "Sequence",
+    "decoders": []
+  },
+  "model": {
+    "type": "Unigram",
+    "unk_id": 0,
+    "vocab": [
+      [
+        "[UNK]",
+        0.0
+      ],
+      [
+        "[BOS]",
+        0.0
+      ],
+      [
+        "[EOS]",
+        0.0
+      ],
+      [
+        "[PAD]",
+        0.0
+      ],
+      [
+        "0",
+        -0.6559799732746541
+      ],
+      [
+        "1",
+        -2.5672971557298077
+      ],
+      [
+        "8",
+        -2.757965529384416
+      ],
+      [
+        "2",
+        -2.907014169935172
+      ],
+      [
+        "|",
+        -2.909668213031553
+      ],
+      [
+        "3",
+        -2.92125116598411
+      ],
+      [
+        "4",
+        -3.1701580199305557
+      ],
+      [
+        "5",
+        -3.1727656536779882
+      ],
+      [
+        "T",
+        -3.58345294144579
+      ],
+      [
+        "6",
+        -3.7734854940880993
+      ],
+      [
+        "7",
+        -3.9640794220178694
+      ],
+      [
+        "9",
+        -4.330040023688497
+      ],
+      [
+        "\n",
+        -5.192945158911211
+      ],
+      [
+        "O",
+        -5.886160223524881
+      ],
+      [
+        "I",
+        -5.886160223524881
+      ]
+    ],
+    "byte_fallback": false
+  }
+}

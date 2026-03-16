@@ -1,44 +1,39 @@
-import time
+import glob
 import inspect
-import os
-from typing import Optional
-import torch
-import torchvision.utils as vutils
-import math
-from torch import nn
-from einops import rearrange
-from dataclasses import dataclass
-import sys
-import random
 import json
-from typing import Tuple
-from torch.nn import LayerNorm
+import logging
+import math
+import os
+import random
+import sys
+from copy import deepcopy
+from dataclasses import dataclass
+from typing import Optional, Tuple
+import torch
+from einops import rearrange
+from torch import nn
 from torch.nn import functional as F
-from transformers.configuration_utils import PretrainedConfig
-from transformers.modeling_utils import PreTrainedModel
-from transformers.modeling_outputs import ModelOutput
-from transformers.loss.loss_utils import ForCausalLMLoss
-from loss import MultiMarginLMLoss, StandardLoss, ArgmaxFocusLoss, FocalLMLoss
-from functools import partial
-from utils.checks import check_tensors, check_model
-from rotary_pos import precompute_freqs, apply_rotary_emb
 
-from blocks.blocks import SoftGradHardTanh, SoftGradHardSigmoid
-from torch.nn import GELU
-
-from blocks.basic_transformer import SelfAttention, SelfAttentionV2, LowRankLinear
+from blocks.basic_transformer import LowRankLinear
+from blocks.blocks import SoftGradHardSigmoid, SoftGradHardTanh
+from loss import ArgmaxFocusLoss, FocalLMLoss, MultiMarginLMLoss, StandardLoss
+from rotary_pos import precompute_freqs
+from utils.checks import check_model
+from utils.config_utils import convert_string_format_to_json_like
 
 try:
-    from blocks.cum_sum_transformer import SelfAttentionCumSumV3, SelfAttentionCumSumV2
+    from blocks.basic_transformer import SelfAttention, SelfAttentionV2
     from blocks.conv3d_transformer import SelfAttentionConv3d
+    from blocks.cum_sum_transformer import SelfAttentionCumSumV2, SelfAttentionCumSumV3
     from blocks.new_transformers import SelfAttentionConv
 except Exception as e:
     print(e)
-from utils.config_utils import convert_string_format_to_json_like
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
-class CausalLMOutputWithCrossAttentions(ModelOutput):
+class CausalLMOutputWithCrossAttentions:
     """Structured output for causal language modeling.
 
     Attributes:
@@ -59,55 +54,67 @@ class CausalLMOutputWithCrossAttentions(ModelOutput):
     cross_attentions: Optional[Tuple[torch.FloatTensor, ...]] = None
 
 
-class CustomGPTConfig(PretrainedConfig):
-    """
+class CustomGPTConfig:
+    """Configuration for the standalone custom GPT model.
+
     Args:
         vocab_size (`int`, *optional*, defaults to 50257):
-            Vocabulary size of the GPT-2 model. Defines the number of different tokens that can be represented by the
-            `inputs_ids` passed when calling [`GPT2Model`] or [`TFGPT2Model`].
+            Vocabulary size of the model.
         context_len (`int`, *optional*, defaults to 1024):
-            The maximum sequence length that this model might ever be used with. Typically set this to something large
-            just in case (e.g., 512 or 1024 or 2048).
+            Maximum sequence length the model can attend to.
         embed_size (`int`, *optional*, defaults to 768):
-            Dimensionality of the embeddings and hidden states.
+            Dimensionality of the token embeddings and hidden states.
         num_layers (`int`, *optional*, defaults to 12):
-            Number of hidden layers in the Transformer encoder.
+            Number of transformer blocks.
         heads (`int`, *optional*, defaults to 12):
-            Number of attention heads for each attention layer in the Transformer encoder.
-        dropout (`float`, *optional*, defaults to 0.1):
-            The dropout.
-        layer_norm_epsilon (`float`, *optional*, defaults to 1e-05):
-            The epsilon to use in the layer normalization layers.
+            Number of attention heads in each transformer block.
+        bias (`bool`, *optional*, defaults to `True`):
+            Whether linear and normalization layers use bias terms.
+        dropout (`float`, *optional*, defaults to 0.0):
+            Dropout probability used throughout the model.
+        layer_norm_epsilon (`float`, *optional*, defaults to 1e-5):
+            Epsilon used by layer normalization.
         initializer_range (`float`, *optional*, defaults to 0.02):
-            The standard deviation of the truncated_normal_initializer for initializing all weight matrices.
+            Standard deviation used to initialize weights.
         selfatt_class (`str`, *optional*, defaults to `"SelfAttention"`):
-            The class to use for self-attention layers.
+            Name of the attention block class to instantiate.
         selfatt_class_kwargs (`dict`, *optional*, defaults to `{}`):
-            Additional keyword arguments to pass to the self-attention class.
+            Extra keyword arguments passed to the attention block class.
         megatron_init (`bool`, *optional*, defaults to `True`):
-            Whether to use Megatron-style initialization.
-        rotary_emb (`int`, *optional*, defaults to `0`):
-            The rotary embedding dimension.
-        rnn_version (`int`, *optional*, defaults to `0`):
-            The version of the RNN-like attention mechanism to use. 0 means no RNN-like attention.
-        step_size_rnn_like (`int`, *optional*, defaults to `64`):
-            The step size for the RNN-like attention mechanism.
-        repeat_block (`int`, *optional*, defaults to `1`):
-            The number of times to repeat the block.
+            Whether to apply Megatron-style scaled initialization to residual projections.
+        rotary_emb (`int`, *optional*, defaults to 0):
+            Rotary embedding dimension. Set to 0 to use learned absolute position embeddings.
+        repeat_block (`int`, *optional*, defaults to 1):
+            Number of times to repeat each middle block when block repetition is enabled.
         random_blocks (`bool`, *optional*, defaults to `False`):
-            Whether to use random blocks.
-        repeat_model (`int`, *optional*, defaults to `1`):
-            The number of times to repeat the model.
+            Whether to shuffle the order of the middle blocks during training.
+        repeat_model (`int`, *optional*, defaults to 1):
+            Number of times to repeat the full middle stack of blocks.
         random_repeat (`bool`, *optional*, defaults to `False`):
-            Whether to use random repeat.
-        loss (`str`, *optional*, defaults to `"ForCausalLMLoss"`):
-            The loss function to use during training.
+            Whether to sample the repeat count from the curriculum range.
+        loss (`str`, *optional*, defaults to `"StandardLoss"`):
+            Name of the loss function defined in this module.
         reduce_loss (`str`, *optional*, defaults to `"mean"`):
-            The reduction method to apply to the loss. Can be `"mean"` or `"sum"`.
-            `"sum"` seems to work better for ARC-AGI tasks where the sequences have variable lengths.
-    ```"""
+            Reduction to apply to the loss. Can be `"mean"` or `"sum"`.
+        aligned_labels (`bool`, *optional*, defaults to `False`):
+            Whether labels are already aligned with logits instead of requiring next-token shifting.
+        curriculum (`bool`, *optional*, defaults to `True`):
+            Whether repeat counts are ramped up during training.
+        use_pos_emb_2d (`bool`, *optional*, defaults to `False`):
+            Whether to add learned 2D positional embeddings from `position_idx`.
+        use_rot_emb_2d (`bool`, *optional*, defaults to `False`):
+            Whether to build 2D rotary embeddings from `position_idx`.
+        all_repeat_losses (`bool`, *optional*, defaults to `False`):
+            Whether to compute extra losses at intermediate repeated blocks.
+        tie_word_embeddings (`bool`, *optional*, defaults to `True`):
+            Whether to share input embedding weights with the output LM head.
 
-    model_type = "custom_gptv0"
+    Notes:
+        The standalone variant stores and serializes only the repo's preferred
+        field names: `context_len`, `embed_size`, `num_layers`, and `heads`.
+    """
+
+    model_type = "custom_gptv0_standalone"
     keys_to_ignore_at_inference = ["past_key_values"]
     legacy_keys = {"max_position_embeddings", "n_positions", "n_embd", "n_head", "n_layer"}
 
@@ -126,8 +133,6 @@ class CustomGPTConfig(PretrainedConfig):
         selfatt_class_kwargs={},
         megatron_init=True,
         rotary_emb=0,
-        rnn_version=0,
-        step_size_rnn_like=64,
         repeat_block=1,
         random_blocks=False,
         repeat_model=1,
@@ -156,13 +161,11 @@ class CustomGPTConfig(PretrainedConfig):
         self.random_repeat = random_repeat
         self.random_blocks = random_blocks
         self.repeat_block = repeat_block
-        self.rnn_version = rnn_version
-        self.step_size_rnn_like = step_size_rnn_like
         self.rotary_emb = rotary_emb
         self.megatron_init = megatron_init
         self.bias = bias
         self.selfatt_class = selfatt_class
-        self.selfatt_class_kwargs = selfatt_class_kwargs
+        self.selfatt_class_kwargs = dict(selfatt_class_kwargs)
         self.vocab_size = vocab_size
         self.context_len = context_len
         self.embed_size = embed_size
@@ -176,61 +179,95 @@ class CustomGPTConfig(PretrainedConfig):
         self.use_rot_emb_2d = use_rot_emb_2d
         self.all_repeat_losses = all_repeat_losses
         self.tie_word_embeddings = tie_word_embeddings
+        for key, value in kwargs.items():
+            setattr(self, key, value)
 
-        super().__init__(tie_word_embeddings=tie_word_embeddings, **kwargs)
+    def __repr__(self):
+        return f"{self.__class__.__name__}({self.to_dict()})"
+
+    def to_dict(self):
+        """Serialize the config to a plain Python dict."""
+
+        data = self._custom_params_dict()
+        for key, value in self.__dict__.items():
+            if key.startswith("_") or callable(value):
+                continue
+            if key not in data:
+                data[key] = deepcopy(value)
+        data["model_type"] = self.model_type
+        return data
+
+    @classmethod
+    def from_dict(cls, config_dict):
+        config_dict = dict(config_dict)
+        config_dict.pop("model_type", None)
+        return cls(**config_dict)
+
+    def save_pretrained(self, save_directory):
+        """Save the config as `config.json` inside `save_directory`."""
+
+        os.makedirs(save_directory, exist_ok=True)
+        with open(os.path.join(save_directory, "config.json"), "w", encoding="utf-8") as handle:
+            json.dump(self.to_dict(), handle, indent=2, sort_keys=True)
+
+    @classmethod
+    def from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
+        """Load a config from a directory or a direct path to `config.json`."""
+
+        config_path = pretrained_model_name_or_path
+        if os.path.isdir(config_path):
+            config_path = os.path.join(config_path, "config.json")
+        with open(config_path, "r", encoding="utf-8") as handle:
+            config_dict = json.load(handle)
+        config_dict.update(kwargs)
+        return cls.from_dict(config_dict)
 
     def update_from_string(self, update_str: str):
-        """
-        Updates attributes of this class with attributes from `update_str`.
+        """Update config attributes from `update_str`.
 
-        json like format:
-        '"selfatt_class":"SelfAttentionDist","selfatt_class_kwargs":{"att_type":"dot","pos_emb_mode":"sum_mul_x"}'
-        The keys to change have to already exist in the config object.
+        The expected format is a relaxed JSON-like string such as:
+        `"selfatt_class":"SelfAttentionDist","selfatt_class_kwargs":{"att_type":"dot"}`
+
+        The keys to change must already exist in the config object.
 
         Args:
-            update_str (`str`): String with attributes that should be updated for this class.
-
+            update_str (`str`): String with attributes that should be updated.
         """
+
         update_str = convert_string_format_to_json_like(update_str)
         print(update_str)
-        d = json.loads(update_str)
-        for k, v in d.items():
-            if not hasattr(self, k):
-                raise ValueError(f"key {k} isn't in the original config dict")
-            setattr(self, k, v)
-        return self._custom_params_dict()
+        update_dict = json.loads(update_str)
+        return self.update_from_dict(update_dict)
 
     def update_from_dict(self, update_dict):
-        """
-        Updates attributes of this class with attributes from `update_dict`.
+        """Update config attributes from `update_dict`.
 
         Returns:
-            dict: Only the parameters defined in CustomGPTConfig.
+            dict: Only the parameters defined directly in `CustomGPTConfig`.
         """
+
         assert isinstance(update_dict, dict)
-        for k, v in update_dict.items():
-            if not hasattr(self, k):
-                raise ValueError(f"key {k} isn't in the original config dict")
-            setattr(self, k, v)
+        for key, value in update_dict.items():
+            if not hasattr(self, key):
+                raise ValueError(f"key {key} isn't in the original config dict")
+            setattr(self, key, value)
         return self._custom_params_dict()
 
     def _custom_params_dict(self):
-        """
-        returns a dict with only the parameters defined in CustomGPTConfig.
-        """
+        """Return only the parameters defined directly on CustomGPTConfig."""
+
         param_names = [
             name
             for name, param in inspect.signature(self.__class__.__init__).parameters.items()
             if name != "self"
             and param.kind not in (inspect.Parameter.VAR_KEYWORD, inspect.Parameter.VAR_POSITIONAL)
         ]
-        return {name: getattr(self, name) for name in param_names}
+        return {name: deepcopy(getattr(self, name)) for name in param_names}
 
 
 def update_dict(d, d2):
-    """
-    Update dict with values from `d2` and return the new dict.
-    """
+    """Return a new dict with `d2` layered on top of `d`."""
+
     new_dict = d.copy()
     new_dict.update(d2)
     return new_dict
@@ -243,16 +280,18 @@ def min_max_repeat_curriculum(
     target_progress: float = 0.7,
     curriculum: bool = True,
 ) -> int:
-    """Scale the maximum value linearly with training progress until target_progress.
+    """Scale the maximum repeat count linearly with training progress.
 
     Args:
-        base_value: Upper bound to reach by target_progress.
-        progress: Fraction of training completed in [0, 1].
-        target_progress: Fraction of training when base_value is fully reached.
+        base_value: Upper bound to reach by `target_progress`.
+        progress: Fraction of training completed in `[0, 1]`.
+        target_progress: Fraction of training when `base_value` is fully reached.
+        curriculum: Whether to apply the ramp or just return the full range.
 
     Returns:
-        Integer cap between 1 and base_value following a linear ramp.
+        Tuple `(min_repeat, max_repeat)` derived from the current progress.
     """
+
     if not curriculum:
         return max(1, base_value // 2), base_value
     progress = min(1.0, max(0.0, progress))
@@ -272,20 +311,21 @@ def min_max_repeat_curriculum(
 
 
 def unfold_input(input, combine_tokens):
-    """Create sliding-window unfolded view across the last dimension.
+    """Create a sliding-window unfolded view across the last dimension.
 
-    Expects input with shape (B, T, C, E) where E == combine_tokens. Pads on the
+    Expects input with shape `(B, T, C, E)` where `E == combine_tokens`. Pads on the
     left by `combine_tokens` zeros, then creates windows of size `combine_tokens`
     with step 1 over the last dimension and returns a tensor shaped like the
-    original (B, T, C, E) but with concatenated windowed features.
+    original `(B, T, C, E)` but with concatenated windowed features.
 
     Args:
-        input: 4D tensor (batch, time, channels, embed) with embed == combine_tokens.
+        input: 4D tensor `(batch, time, channels, embed)` with `embed == combine_tokens`.
         combine_tokens: Size of the sliding window.
 
     Returns:
-        Tensor shaped (B, T, C, E) containing unfolded features.
+        Tensor shaped `(B, T, C, E)` containing unfolded features.
     """
+
     assert input.ndim == 4
     assert input.shape[-1] == combine_tokens
     input = nn.functional.pad(input, (combine_tokens, 0), mode="constant", value=0)
@@ -302,12 +342,10 @@ def unfold_input(input, combine_tokens):
     return input_tensor_unfold
 
 
-class CustomGPTmodel(PreTrainedModel):
+class CustomGPTmodel(nn.Module):
     config_class = CustomGPTConfig
-    base_model_prefix = "_orig_mod"
-    _tied_weights_keys = {"lin_head.weight": "word_emb.weight"}
 
-    def __init__(self, config):
+    def __init__(self, config: CustomGPTConfig):
         """Initialize the GPT-like model from a `CustomGPTConfig`.
 
         Sets up token and position embeddings, transformer blocks (potentially
@@ -315,7 +353,8 @@ class CustomGPTmodel(PreTrainedModel):
         and loss function. Also applies weight initialization and optionally
         ties input and output embeddings.
         """
-        super().__init__(config)
+
+        super().__init__()
         self.config = config
         self.word_emb = nn.Embedding(config.vocab_size, config.embed_size)
         if config.rotary_emb > 0:
@@ -336,15 +375,16 @@ class CustomGPTmodel(PreTrainedModel):
             self.pos_emb_y = nn.Embedding(48, config.embed_size)
         self.drop = nn.Dropout(config.dropout)
         selfatt_class = getattr(sys.modules[__name__], config.selfatt_class)
-        if config.selfatt_class_kwargs.get("softmax_replacement", None) is not None:
-            config.selfatt_class_kwargs["softmax_replacement"] = getattr(
+        selfatt_class_kwargs = dict(config.selfatt_class_kwargs)
+        if selfatt_class_kwargs.get("softmax_replacement", None) is not None:
+            selfatt_class_kwargs["softmax_replacement"] = getattr(
                 sys.modules[__name__],
-                config.selfatt_class_kwargs["softmax_replacement"],
+                selfatt_class_kwargs["softmax_replacement"],
             )
-        if config.selfatt_class_kwargs.get("norm_before_softmax", None) is not None:
-            config.selfatt_class_kwargs["norm_before_softmax"] = getattr(
+        if selfatt_class_kwargs.get("norm_before_softmax", None) is not None:
+            selfatt_class_kwargs["norm_before_softmax"] = getattr(
                 sys.modules[__name__],
-                config.selfatt_class_kwargs["norm_before_softmax"],
+                selfatt_class_kwargs["norm_before_softmax"],
             )
         self.transf = nn.ModuleList(
             [
@@ -355,46 +395,56 @@ class CustomGPTmodel(PreTrainedModel):
                     config.context_len,
                     config.dropout,
                     eps_norm=config.layer_norm_epsilon,
-                    **update_dict(config.selfatt_class_kwargs, {"layer_id": layer_id}),
+                    **update_dict(selfatt_class_kwargs, {"layer_id": layer_id}),
                 )
                 for layer_id in range(config.num_layers)
             ]
         )
         self.norm = nn.LayerNorm(config.embed_size, bias=config.bias, eps=config.layer_norm_epsilon)
-        if self.config.rnn_version == 3:
-            # self.norm_rnn = nn.LayerNorm(
-            #     config.embed_size, bias=config.bias, eps=config.layer_norm_epsilon
-            # )
-            self.lin_head_rnn_k = nn.Linear(
-                config.embed_size * 2 // self.config.heads,
-                config.embed_size // self.config.heads,
-                bias=False,
-            )
-            self.lin_head_rnn_v = nn.Linear(
-                config.embed_size * 2 // self.config.heads,
-                config.embed_size // self.config.heads,
-                bias=False,
-            )
-        if self.config.rnn_version == 5:
-            self.lin_head_rnn = nn.Linear(config.embed_size * 2, config.embed_size, bias=False)
-            self.norm_rnn = nn.LayerNorm(config.embed_size, bias=config.bias, eps=config.layer_norm_epsilon)
-            self.norm_rnn2 = nn.LayerNorm(config.embed_size, bias=config.bias, eps=config.layer_norm_epsilon)
         self.lin_head = nn.Linear(config.embed_size, config.vocab_size, bias=False)
         self.loss_function = getattr(sys.modules[__name__], self.config.loss)
         self.apply(self._init_weights)
 
-        # using PretrainedModel's tie weights function to tie the word embeddings and the output head
-        # it checks _tied_weights_keys
-        # it's better to use this function because it saves correctly the tied weights during save_pretrained
+        # Standalone models do not inherit HF's automatic weight tying logic,
+        # so input/output sharing is handled explicitly here.
         self.tie_weights()
+
+    def get_input_embeddings(self):
+        """Return the token embedding module used by the model."""
+
+        return self.word_emb
+
+    def set_input_embeddings(self, new_embeddings):
+        """Set the token embedding module used by the model."""
+
+        self.word_emb = new_embeddings
+        if self.config.tie_word_embeddings:
+            self.tie_weights()
 
     def get_output_embeddings(self):
         """Return the output embedding (LM head) module."""
+
         return self.lin_head
 
     def set_output_embeddings(self, new_embeddings):
         """Set the output embedding (LM head) module."""
+
         self.lin_head = new_embeddings
+        if self.config.tie_word_embeddings:
+            self.tie_weights()
+
+    def tie_weights(self):
+        """Tie output projection weights to input embedding weights when requested.
+
+        When `tie_word_embeddings` is disabled after being enabled, the LM head is
+        re-materialized as an independent parameter tensor.
+        """
+
+        if self.config.tie_word_embeddings:
+            self.lin_head.weight = self.word_emb.weight
+        elif self.lin_head.weight is self.word_emb.weight:
+            self.lin_head.weight = nn.Parameter(self.word_emb.weight.detach().clone())
+        return self
 
     def _init_weights(self, module):
         """Initialize module weights following Transformer conventions.
@@ -403,6 +453,7 @@ class CustomGPTmodel(PreTrainedModel):
         - LayerNorm: weight=1, bias=0
         - Optionally apply Megatron-style scaled init to attention proj ('c_proj').
         """
+
         if isinstance(module, LowRankLinear):
             module.reset_parameters(init_std=self.config.initializer_range)
             return
@@ -426,7 +477,7 @@ class CustomGPTmodel(PreTrainedModel):
 
         # Reinitialize selected weights subject to the OpenAI GPT-2 Paper Scheme:
         #   > A modified initialization which accounts for the accumulation on the residual path with model depth. Scale
-        #   > the weights of residual layers at initialization by a factor of 1/√N where N is the # of residual layers.
+        #   > the weights of residual layers at initialization by a factor of 1/sqrt(N) where N is the # of residual layers.
         #   >   -- GPT-2 :: https://openai.com/blog/better-language-models/
         #
         # Reference (Megatron-LM): https://github.com/NVIDIA/Megatron-LM/blob/main/megatron/model/gpt_model.py
@@ -437,14 +488,118 @@ class CustomGPTmodel(PreTrainedModel):
             # `named_parameters()` recursively, to avoid repeatedly touching the same params.
             c_proj = getattr(module, "c_proj", None)
             if c_proj is not None:
-                print(
+                logger.debug(
                     f"Applying Megatron-style init scaling to {module.__class__}.c_proj with scale {scale:.4f}"
                 )
                 if isinstance(c_proj, nn.Linear):
                     c_proj.weight.data.normal_(mean=0.0, std=(self.config.initializer_range * scale))
                 elif isinstance(c_proj, LowRankLinear):
-                    # Reinitialize low-rank c_proj so the *fused* weight matches the scaled std.
+                    # Reinitialize low-rank c_proj so the fused weight matches the scaled std.
                     c_proj.reset_parameters(init_std=(self.config.initializer_range * scale))
+
+    def resize_token_embeddings(self, new_num_tokens):
+        """Resize token embeddings and the LM head while preserving existing weights.
+
+        Args:
+            new_num_tokens: New vocabulary size.
+
+        Returns:
+            The resized input embedding module.
+        """
+
+        old_num_tokens, embed_dim = self.word_emb.weight.shape
+        if new_num_tokens is None or new_num_tokens == old_num_tokens:
+            return self.word_emb
+
+        old_input_weight = self.word_emb.weight.data.clone()
+        old_output_weight = self.lin_head.weight.data.clone()
+
+        new_embeddings = nn.Embedding(new_num_tokens, embed_dim)
+        self._init_weights(new_embeddings)
+        num_to_copy = min(old_num_tokens, new_num_tokens)
+        new_embeddings.weight.data[:num_to_copy] = old_input_weight[:num_to_copy]
+        self.word_emb = new_embeddings
+
+        new_lm_head = nn.Linear(embed_dim, new_num_tokens, bias=False)
+        self._init_weights(new_lm_head)
+        new_lm_head.weight.data[:num_to_copy] = old_output_weight[:num_to_copy]
+        self.lin_head = new_lm_head
+
+        self.config.vocab_size = new_num_tokens
+        self.tie_weights()
+        return self.word_emb
+
+    def save_pretrained(
+        self,
+        save_directory,
+        is_main_process=True,
+        save_function=torch.save,
+        state_dict=None,
+        **kwargs,
+    ):
+        """Save config and weights in a lightweight HF-like directory layout.
+
+        Args:
+            save_directory: Output directory.
+            is_main_process: Skip saving on non-main processes.
+            save_function: Function used to serialize the state dict.
+            state_dict: Optional precomputed state dict. Defaults to `self.state_dict()`.
+        """
+
+        del kwargs
+        if not is_main_process:
+            return
+        os.makedirs(save_directory, exist_ok=True)
+        self.config.save_pretrained(save_directory)
+        if state_dict is None:
+            state_dict = self.state_dict()
+        save_function(state_dict, os.path.join(save_directory, "pytorch_model.bin"))
+
+    @classmethod
+    def from_pretrained(
+        cls,
+        pretrained_model_name_or_path,
+        config=None,
+        map_location="cpu",
+        strict=True,
+        output_loading_info=False,
+        **kwargs,
+    ):
+        """Load a standalone model from a directory or direct weight file path.
+
+        Args:
+            pretrained_model_name_or_path: Directory containing `config.json` and weights,
+                or a direct path to a `.bin` file.
+            config: Optional config instance. Loaded from disk when omitted.
+            map_location: Device mapping passed to `torch.load`.
+            strict: Whether `load_state_dict` should enforce an exact key match.
+            output_loading_info: Whether to return missing/unexpected key info.
+
+        Returns:
+            `CustomGPTmodel`, or `(model, loading_info)` when `output_loading_info=True`.
+        """
+
+        del kwargs
+        if config is None:
+            config = cls.config_class.from_pretrained(pretrained_model_name_or_path)
+        model = cls(config)
+        weight_path = pretrained_model_name_or_path
+        if os.path.isdir(pretrained_model_name_or_path):
+            candidate_paths = [
+                os.path.join(pretrained_model_name_or_path, "pytorch_model.bin"),
+                os.path.join(pretrained_model_name_or_path, "model.bin"),
+            ]
+            candidate_paths.extend(sorted(glob.glob(os.path.join(pretrained_model_name_or_path, "*.bin"))))
+            weight_path = next((path for path in candidate_paths if os.path.exists(path)), None)
+            if weight_path is None:
+                raise FileNotFoundError(
+                    f"Could not find a .bin weights file in {pretrained_model_name_or_path}"
+                )
+        state_dict = torch.load(weight_path, map_location=map_location)
+        missing, unexpected = model.load_state_dict(state_dict, strict=strict)
+        if output_loading_info:
+            return model, {"missing_keys": missing, "unexpected_keys": unexpected, "mismatched_keys": []}
+        return model
 
     def forward(
         self,
@@ -475,12 +630,11 @@ class CustomGPTmodel(PreTrainedModel):
             CausalLMOutputWithCrossAttentions with logits (B, T, V), optional loss,
             and optional past_key_values when return_cache=True.
         """
+
+        del kwargs
         if attention_mask is not None and attention_mask.min() == 1:
-            # to speed up forward
+            # Skip mask handling when the mask is all ones to speed up forward.
             attention_mask = None
-        # if attention_mask is not None:
-        #     print("attention_mask used!!")
-        #     print(attention_mask)
         random_repeat = self.config.random_repeat and not return_cache and not eval_mode
         progress = min(1.0, max(0.0, train_progress))
 
@@ -539,75 +693,77 @@ class CustomGPTmodel(PreTrainedModel):
             k_cache = [None for _ in range(self.config.num_layers * self.config.repeat_model)]
         if v_cache is None:
             v_cache = [None for _ in range(self.config.num_layers * self.config.repeat_model)]
-        if self.config.rnn_version > 0:
-            x = self.rnn_like(
-                x,
-                self.transf,
-                attention_mask,
-                freqs_cis,
-                k_cache=k_cache,
-                v_cache=v_cache,
-                step_size=self.config.step_size_rnn_like,
-                version=self.config.rnn_version,
+        is_before_out_idx = []
+        if self.config.repeat_block > 1:
+            min_repeat, max_repeat = min_max_repeat_curriculum(
+                self.config.repeat_block, progress, curriculum=self.config.curriculum
             )
-            check_tensors(x, "rnn_like output")
-        else:
-            is_before_out_idx = []
-            if self.config.repeat_block > 1:
-                min_repeat, max_repeat = min_max_repeat_curriculum(
-                    self.config.repeat_block, progress, curriculum=self.config.curriculum
-                )
-                assert not self.config.random_blocks
-                assert self.config.repeat_model == 1
-                transf = []
-                for layer_id, block in enumerate(self.transf):
-                    if layer_id == 0 or layer_id == len(self.transf) - 1:
-                        repeat_block = 1
-                    else:
-                        if random_repeat:
-                            repeat_block = random.randint(min_repeat, max_repeat)
-                        else:
-                            repeat_block = max_repeat
-                    for _ in range(repeat_block):
-                        transf.append(block)
-            elif self.config.random_blocks:
-                transf = (
-                    [self.transf[0]]
-                    + random.sample(list(self.transf)[1:-1], len(self.transf) - 2)
-                    + [self.transf[-1]]
-                )
-            elif self.config.repeat_model > 1:
-                min_repeat, max_repeat = min_max_repeat_curriculum(
-                    self.config.repeat_model, progress, curriculum=self.config.curriculum
-                )
-                transf = [self.transf[0]]
-                is_before_out_idx.append(False)
-                if random_repeat:
-                    num_repeats = random.randint(min_repeat, max_repeat)
+            assert not self.config.random_blocks
+            assert self.config.repeat_model == 1
+            transf = []
+            for layer_id, block in enumerate(self.transf):
+                if layer_id == 0 or layer_id == len(self.transf) - 1:
+                    repeat_block = 1
                 else:
-                    num_repeats = max_repeat
-                for idx_rep in range(num_repeats):
-                    transf += list(self.transf)[1:-1]
-                    if idx_rep < min_repeat:
-                        is_before_out_idx += [False] * (len(self.transf) - 2)
+                    if random_repeat:
+                        repeat_block = random.randint(min_repeat, max_repeat)
                     else:
-                        is_before_out_idx += [False] * (len(self.transf) - 3) + [True]
-                transf.append(self.transf[-1])
-                is_before_out_idx.append(False)
+                        repeat_block = max_repeat
+                for _ in range(repeat_block):
+                    transf.append(block)
+        elif self.config.random_blocks:
+            transf = (
+                [self.transf[0]]
+                + random.sample(list(self.transf)[1:-1], len(self.transf) - 2)
+                + [self.transf[-1]]
+            )
+        elif self.config.repeat_model > 1:
+            min_repeat, max_repeat = min_max_repeat_curriculum(
+                self.config.repeat_model, progress, curriculum=self.config.curriculum
+            )
+            transf = [self.transf[0]]
+            is_before_out_idx.append(False)
+            if random_repeat:
+                num_repeats = random.randint(min_repeat, max_repeat)
             else:
-                transf = self.transf
-            k_cache = k_cache[: len(transf)]
-            v_cache = v_cache[: len(transf)]
-            additional_logits = []
-            for layer_id, block in enumerate(transf):
-                # Trim cache if total sequence would exceed max positions.
-                if v_cache[layer_id] is not None:
-                    if v_cache[layer_id].shape[-2] + x.shape[1] > self.config.context_len:
-                        num_pos = self.config.context_len - x.shape[1]
-                        v_cache[layer_id] = v_cache[layer_id][:, :, -num_pos:]
-                        k_cache[layer_id] = k_cache[layer_id][:, :, -num_pos:]
-                        assert v_cache[layer_id].shape[-2] + x.shape[1] == self.config.context_len
-                x = block(
+                num_repeats = max_repeat
+            for idx_rep in range(num_repeats):
+                transf += list(self.transf)[1:-1]
+                if idx_rep < min_repeat:
+                    is_before_out_idx += [False] * (len(self.transf) - 2)
+                else:
+                    is_before_out_idx += [False] * (len(self.transf) - 3) + [True]
+            transf.append(self.transf[-1])
+            is_before_out_idx.append(False)
+        else:
+            transf = self.transf
+        k_cache = k_cache[: len(transf)]
+        v_cache = v_cache[: len(transf)]
+        additional_logits = []
+        for layer_id, block in enumerate(transf):
+            if v_cache[layer_id] is not None:
+                # Trim cache if total sequence would exceed the model context.
+                if v_cache[layer_id].shape[-2] + x.shape[1] > self.config.context_len:
+                    num_pos = self.config.context_len - x.shape[1]
+                    v_cache[layer_id] = v_cache[layer_id][:, :, -num_pos:]
+                    k_cache[layer_id] = k_cache[layer_id][:, :, -num_pos:]
+                    assert v_cache[layer_id].shape[-2] + x.shape[1] == self.config.context_len
+            x = block(
+                x,
+                attention_mask=attention_mask,
+                freqs=freqs_cis,
+                v_cache=v_cache[layer_id],
+                k_cache=k_cache[layer_id],
+                return_cache=return_cache,
+            )
+            if (
+                labels is not None
+                and self.config.all_repeat_losses
+                and is_before_out_idx != []
+                and is_before_out_idx[layer_id]
+                and not return_cache
+            ):
+                add_out = transf[-1](
                     x,
                     attention_mask=attention_mask,
                     freqs=freqs_cis,
@@ -615,27 +771,12 @@ class CustomGPTmodel(PreTrainedModel):
                     k_cache=k_cache[layer_id],
                     return_cache=return_cache,
                 )
-                if (
-                    labels is not None
-                    and self.config.all_repeat_losses
-                    and is_before_out_idx != []
-                    and is_before_out_idx[layer_id]
-                    and not return_cache
-                ):
-                    add_out = transf[-1](
-                        x,
-                        attention_mask=attention_mask,
-                        freqs=freqs_cis,
-                        v_cache=v_cache[layer_id],
-                        k_cache=k_cache[layer_id],
-                        return_cache=return_cache,
-                    )
-                    add_out = self.norm(add_out)
-                    additional_logits.append(self.lin_head(add_out))
-                if return_cache:
-                    k_cache[layer_id] = x[1]
-                    v_cache[layer_id] = x[2]
-                    x = x[0]
+                add_out = self.norm(add_out)
+                additional_logits.append(self.lin_head(add_out))
+            if return_cache:
+                k_cache[layer_id] = x[1]
+                v_cache[layer_id] = x[2]
+                x = x[0]
         x = self.norm(x)
         logits = self.lin_head(x)
         check_model(self)
@@ -678,14 +819,7 @@ class CustomGPTmodel(PreTrainedModel):
                 tuple(k_cache) if return_cache else None,
                 tuple(v_cache) if return_cache else None,
             ),
-            # hidden_states=transformer_outputs.hidden_states,
-            # attentions=transformer_outputs.attentions,
-            # cross_attentions=transformer_outputs.cross_attentions,
         )
-
-    def get_input_embeddings(self):
-        """Return the token embedding module used by the model."""
-        return self.word_emb
 
     def generate(
         self,
@@ -702,14 +836,28 @@ class CustomGPTmodel(PreTrainedModel):
         train_progress=1.0,
         position_idx=None,
     ):
-        """
-        Take a conditioning sequence of indices idx (LongTensor of shape (b,t)) and complete
-        the sequence max_length times, feeding the predictions back into the model each time.
-        Most likely you'll want to make sure to be in model.eval() mode of operation for this.
-        This implementation supports optional caching when `return_cache=True`,
-        which enables efficient incremental decoding.
+        """Autoregressively extend a prompt, optionally reusing attention caches.
+
+        Args:
+            input_ids: Conditioning token ids of shape `(B, T)`.
+            attention_mask: Optional attention mask. The standalone path currently expects
+                either `None` or an all-ones mask.
+            max_length: Number of new tokens to generate.
+            temperature: Logit temperature.
+            top_k: If set, restrict sampling to the top-k logits. Use `0` for greedy decoding.
+            eos_token_id: Optional stop token id.
+            pad_token_id: Unused, kept for API compatibility.
+            token_type_ids: Unused, kept for API compatibility.
+            return_cache: Whether to reuse K/V caches across decoding steps.
+            debug: Whether to print per-step debugging information.
+            train_progress: Forwarded to `forward` for curriculum-aware decoding.
+            position_idx: Optional 2D positions of shape `(B, T_total, 2)`.
+
+        Returns:
+            Token ids containing the original prompt followed by the generated tokens.
         """
 
+        del pad_token_id, token_type_ids
         if attention_mask is not None and attention_mask.min() == 1:
             attention_mask = None
         assert attention_mask is None
@@ -719,7 +867,7 @@ class CustomGPTmodel(PreTrainedModel):
                     f"position_idx must be (B, T, 2) and match batch size; got {position_idx.shape}"
                 )
             # When decoding autoregressively we only need position indices for tokens that
-            # are actually *fed into the model*.
+            # are actually fed into the model.
             #
             # For `max_length=1`, the newly generated token is never re-fed (the loop ends),
             # so requiring an additional position slot is unnecessarily strict and can
@@ -749,17 +897,19 @@ class CustomGPTmodel(PreTrainedModel):
                     k_cache = [k[:, -self.config.context_len :] for k in k_cache]
                     v_cache = [v[:, -self.config.context_len :] for v in v_cache]
             else:
-                # if the sequence context is growing too long we must crop it at block_size
+                # Recompute from the full prefix, cropped to the model context window.
                 idx_cond = (
                     input_ids
                     if input_ids.size(1) <= self.config.context_len
                     else input_ids[:, -self.config.context_len :]
                 )
                 if position_idx is not None:
-                    # Align to the current prefix; position_idx may include future slots.
+                    # `position_idx` can contain positions for future decode steps.
+                    # First keep only positions for the tokens already generated,
+                    # then take the trailing slice that matches the cropped `idx_cond`.
                     pos_idx_full = position_idx[:, : input_ids.shape[1], :]
                     pos_idx_cond = pos_idx_full[:, -idx_cond.shape[1] :, :]
-            # forward the model to get the logits for the index in the sequence
+            # Forward the model to get the logits for the index in the sequence.
             out = self(
                 idx_cond,
                 position_idx=pos_idx_cond if position_idx is not None else None,
@@ -774,21 +924,21 @@ class CustomGPTmodel(PreTrainedModel):
             logits = out.logits
             if debug:
                 print("logits", logits[:, -1, :])
-            # pluck the logits at the final step and scale by desired temperature
+            # Use the final-step logits as the next-token distribution, then apply temperature.
             logits = logits[:, -1, :] / temperature
-            # optionally crop the logits to only the top k options
+            # Optionally crop the logits to only the top k options.
             if top_k is not None and top_k > 0:
-                v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
-                logits[logits < v[:, [-1]]] = -float("Inf")
+                values, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+                logits[logits < values[:, [-1]]] = -float("Inf")
             if top_k == 0:
-                # greedy decoding
+                # Greedy decoding.
                 idx_next = torch.argmax(logits, dim=-1, keepdim=True)
             else:
-                # apply softmax to convert logits to (normalized) probabilities
+                # Apply softmax to convert logits to probabilities before sampling.
                 probs = F.softmax(logits, dim=-1)
-                # sample from the distribution
+                # Sample from the distribution.
                 idx_next = torch.multinomial(probs, num_samples=1)
-            # append sampled index to the running sequence and continue
+            # Append sampled index to the running sequence and continue.
             if debug:
                 print("idx_next", idx_next)
                 breakpoint()
@@ -803,115 +953,3 @@ class CustomGPTmodel(PreTrainedModel):
                 if done.all():
                     break
         return input_ids
-
-    def rnn_like(
-        self,
-        x,
-        transf,
-        attention_mask,
-        freqs,
-        k_cache=None,
-        v_cache=None,
-        step_size=32,
-        version=None,
-    ):
-        """Chunked, RNN-like application of transformer blocks with cache mixing.
-
-        Processes the sequence in windows of `step_size`, updating per-layer
-        key/value caches as it goes. Depending on `version`, caches are shifted
-        or combined between layers to introduce recurrence across depth.
-
-        Args:
-            x: Input tensor (B, T, E).
-            transf: Iterable of transformer blocks to apply per chunk.
-            attention_mask: Optional mask (B, T) or None.
-            freqs: Optional rotary embeddings per position, or None.
-            k_cache, v_cache: Lists of per-layer caches (or None) updated in-place.
-            step_size: Window size along time dimension.
-            version: Integer selecting the cache mixing strategy.
-
-        Returns:
-            Tensor of same shape as `x` with processed features.
-        """
-        out_x = []
-        final_x_t = torch.zeros((x.size(0), step_size, x.size(2)), dtype=x.dtype, device=x.device)
-        for t in range(math.ceil(x.size(1) / step_size)):
-            x_t = x[:, t * step_size : (t + 1) * step_size]
-            # xt_part1, xt_part2 = x_t[:, 0:1], x_t[:, 1:]
-            # xt_part1 += self.lin_head_rnn(torch.cat([xt_part1, final_x_t], dim=2))
-            # x_t = torch.cat([xt_part1, xt_part2], dim=1)
-            # print(f"t {t} x_t {x_t.shape} final_x_t {final_x_t.shape}")
-            if version == 5:
-                x_t = x_t + self.lin_head_rnn(
-                    torch.cat([self.norm_rnn(x_t), self.norm_rnn2(final_x_t)], dim=2)
-                )
-            elif version == 6:
-                x_t = x_t + torch.tanh(
-                    self.lin_head_rnn(torch.cat([self.norm_rnn(x_t), self.norm_rnn2(final_x_t)], dim=2))
-                )
-            num_layers = len(transf)
-            for layer_id, block in enumerate(transf):
-                if freqs is None:
-                    freqs_t = None
-                elif freqs.dim() == 3:
-                    # (T_total, half, 2)
-                    freqs_t = freqs[t * step_size : (t + 1) * step_size]
-                else:
-                    raise ValueError(f"Unsupported freqs rank {freqs.dim()} for rnn_like")
-                x_t, k_cache[layer_id], v_cache[layer_id] = block(
-                    x_t,
-                    attention_mask=attention_mask,
-                    freqs=freqs_t,
-                    k_cache=k_cache[layer_id],
-                    v_cache=v_cache[layer_id],
-                    return_cache=True,
-                )
-            if version == 1:
-                for layer_id in range(num_layers // 2):
-                    k_cache[layer_id] = k_cache[layer_id + num_layers // 2]
-                    v_cache[layer_id] = v_cache[layer_id + num_layers // 2]
-            elif version == 2:
-                for layer_id in range(num_layers - 1):
-                    k_cache[layer_id] = k_cache[layer_id + 1]
-                    v_cache[layer_id] = v_cache[layer_id + 1]
-            elif version == 3:
-                for layer_id in range(num_layers - 1):
-                    k_cache[layer_id] = self.lin_head_rnn_k(
-                        torch.cat([k_cache[layer_id], k_cache[layer_id + 1]], dim=-1)
-                    )
-                    v_cache[layer_id] = self.lin_head_rnn_v(
-                        torch.cat([v_cache[layer_id], v_cache[layer_id + 1]], dim=-1)
-                    )
-            elif version == 4:
-                for layer_id in range(num_layers - 1):
-                    k_cache[layer_id] = self.lin_head_rnn_k(
-                        torch.cat([k_cache[layer_id], k_cache[num_layers - 1]], dim=-1)
-                    )
-                    v_cache[layer_id] = self.lin_head_rnn_v(
-                        torch.cat([v_cache[layer_id], v_cache[num_layers - 1]], dim=-1)
-                    )
-            elif version in [10, 5]:
-                pass
-            else:
-                raise NotImplementedError(f"version {version} not implemented")
-            # for j in range(num_layers//2):
-            #     k_cache_j_after = k_cache[j][:,:,t * step_size : (t + 1) * step_size]
-            #     v_cache_j_after = v_cache[j][:,:,t * step_size : (t + 1) * step_size]
-            #     k_cache_j_before = k_cache[j][:,:,: t * step_size]
-            #     v_cache_j_before = v_cache[j][:,:,: t * step_size]
-            #     k_cache_inv_after = k_cache[num_layers-j-1][:, :, t * step_size : (t + 1) * step_size]
-            #     v_cache_inv_after = v_cache[num_layers-j-1][:, :, t * step_size : (t + 1) * step_size]
-            #     k_cache_inv_before = k_cache[num_layers-j-1][:, :, : t * step_size]
-            #     v_cache_inv_before = v_cache[num_layers-j-1][:, :, : t * step_size]
-            #     k_cache[j] = torch.cat([k_cache_j_before, k_cache_inv_after], dim=2)
-            #     v_cache[j] = torch.cat([v_cache_j_before, v_cache_inv_after], dim=2)
-            #     k_cache[num_layers-j-1] = torch.cat([k_cache_inv_before, k_cache_j_after], dim=2)
-            #     v_cache[num_layers-j-1] = torch.cat([v_cache_inv_before, v_cache_j_after], dim=2)
-            # k_cache = k_cache[::-1]  # reverse the order of k_cache
-            # v_cache = v_cache[::-1]
-            final_x_t = x_t
-
-            out_x.append(x_t)
-        out = torch.cat(out_x, dim=1)
-        assert out.shape == x.shape, f"{out.shape} != {x.shape}"
-        return out

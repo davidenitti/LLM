@@ -3,6 +3,7 @@ RNN models
 work in progress!
 to test and check!
 """
+
 import torch
 from torch import nn
 import numpy as np
@@ -19,6 +20,9 @@ from einops import rearrange
 
 from blocks import SoftGradHardTanh, SoftGradHardSigmoid
 from utils import convert_string_format_to_json_like
+from checks import check_tensors
+from basic_transformer import MLP
+
 
 class RNNCell(nn.Module):
     def __init__(
@@ -40,10 +44,11 @@ class RNNCell(nn.Module):
         if self.sum_residual:
             assert self.hidden_size == input_size, "sum_residual only works if hidden_size == input_size"
         self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
+        self.start_hidden = nn.Parameter(torch.randn(1, self.hidden_size) * 0.02)
 
     def forward(self, x, prev_hidden):
         if prev_hidden is None:
-            prev_hidden = torch.zeros(x.size(0), self.hidden_size, device=x.device)
+            prev_hidden = self.start_hidden.repeat(x.size(0), 1)
         combined = torch.cat((x, prev_hidden), 1)
         hidden = self.transition(combined)
         out = self.out_layer(self.norm(hidden))
@@ -61,7 +66,9 @@ class LSTMCell(nn.Module):
         act_sigmoid,
         act_tanh,
         sum_residual=False,
-        out_layer=False,
+        mlp=False,
+        inp_residual=False,
+        norm_inp=False,
         norm=False,
         norm_c=False,
         dropout=0.0,
@@ -73,34 +80,64 @@ class LSTMCell(nn.Module):
         self.act_tanh = act_tanh
         self.norm = nn.LayerNorm(hidden_size) if norm else nn.Identity()
         self.norm_c = nn.LayerNorm(hidden_size) if norm_c else nn.Identity()
-        self.transition = nn.Linear(input_size + hidden_size, 3 * hidden_size)
+        if norm_inp:
+            self.norm_inp = nn.LayerNorm(input_size)
+            self.norm_hidden = nn.LayerNorm(hidden_size)
+        else:
+            self.norm_inp = nn.Identity()
+            self.norm_hidden = nn.Identity()
+
+        self.inp_residual = inp_residual
+        size_transition = input_size if self.inp_residual else input_size + hidden_size
+        self.transition = nn.Linear(size_transition, 3 * hidden_size)
         self.sum_residual = sum_residual
         if self.sum_residual:
             assert self.hidden_size == input_size, "sum_residual only works if hidden_size == input_size"
-        if out_layer:
-            self.out_layer = nn.Linear(hidden_size, hidden_size)
+
+        if mlp:
+            assert self.sum_residual
+            self.mlp = MLP(
+                hidden_size,
+                True,
+                dropout,
+            )
         else:
-            self.out_layer = nn.Identity()
+            self.mlp = None
         self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
+        self.start_hidden = nn.Parameter(torch.randn(1, self.hidden_size) * 0.02)
+        self.start_cell = nn.Parameter(torch.randn(1, self.hidden_size) * 0.02)
 
     def forward(self, x, prev):
+        # x shape B,C
         if prev is None:
-            prev_hidden = torch.zeros(x.size(0), self.hidden_size, device=x.device)
-            prev_cell = torch.zeros(x.size(0), self.hidden_size, device=x.device)
+            prev_hidden = self.start_hidden.repeat(x.size(0), 1)
+            prev_cell = self.start_cell.repeat(x.size(0), 1)
         else:
             prev_hidden, prev_cell = prev
-
-        gates = self.transition(torch.cat((x, prev_hidden), 1))
+        if self.inp_residual:
+            gates = self.transition(self.norm_inp(x))
+        else:
+            gates = self.transition(torch.cat((self.norm_inp(x), self.norm_hidden(prev_hidden)), 1))
         inp_gate, cell_gate, out_gate = gates.chunk(3, 1)
+        if self.inp_residual:
+            inp_gate = inp_gate + prev_hidden
+            cell_gate = cell_gate + prev_hidden
+            out_gate = out_gate + prev_hidden
         inp_gate = self.act_sigmoid(inp_gate)
         cell_gate = self.act_tanh(cell_gate)
         out_gate = self.act_sigmoid(out_gate)
         cell = (1 - inp_gate) * prev_cell + inp_gate * cell_gate
         hidden = out_gate * self.act_tanh(self.norm_c(cell))
-        out = self.out_layer(self.norm(hidden))
+        out = hidden
         if self.sum_residual:
             out = out + x
+            if self.mlp is not None:
+                out = out + self.mlp(out)
+
         out = self.dropout(out)
+        check_tensors(out, "out")
+        check_tensors(hidden, "hidden")
+        check_tensors(cell, "cell")
         return out, (hidden, cell)
 
 
@@ -114,18 +151,21 @@ class RNN(nn.Module):
         self.rnn = nn.ModuleList(self.rnn_cells)
         self.hidden_size = hidden_size
 
-    def forward(self, x, hidden=None, detach_steps=10000):
+    def forward(self, x, hidden=None, detach_steps=None, reset_every=None):
         # x is of shape (batch_size, seq_len, input_size)
         if hidden is None:
             hidden = [None for _ in range(self.num_layers)]
         outputs = []
+
         for i in range(x.size(1)):
-            out, hidden[0] = self.rnn[0](x[:, i], hidden[0])
-            for j in range(1, self.num_layers):
+            out = x[:, i]
+            for j in range(0, self.num_layers):
                 out, hidden[j] = self.rnn[j](out, hidden[j])
             outputs.append(out)
-            if (i + 1) % detach_steps == 0:
+            if detach_steps is not None and (i + 1) % detach_steps == 0:
                 hidden = [h.detach() for h in hidden]
+            if reset_every is not None and (i + 1) % reset_every == 0:
+                hidden = [None for _ in range(self.num_layers)]
         out = torch.stack(outputs, dim=1)
         assert out.size() == (x.size(0), x.size(1), self.hidden_size)
         return out, hidden
@@ -144,8 +184,6 @@ class CustomRNNConfig(PretrainedConfig):
             Dimensionality of the embeddings and hidden states.
         n_layer (`int`, *optional*, defaults to 12):
             Number of hidden layers in the Transformer encoder.
-        n_head (`int`, *optional*, defaults to 12):
-            Number of attention heads for each attention layer in the Transformer encoder.
         activation_function (`str`, *optional*, defaults to `"gelu_new"`):
             Activation function, to be selected in the list `["relu", "silu", "gelu", "tanh", "gelu_new"]`.
         dropout (`float`, *optional*, defaults to 0.1):
@@ -154,10 +192,6 @@ class CustomRNNConfig(PretrainedConfig):
             The epsilon to use in the layer normalization layers.
         initializer_range (`float`, *optional*, defaults to 0.02):
             The standard deviation of the truncated_normal_initializer for initializing all weight matrices.
-        bos_token_id (`int`, *optional*, defaults to 50256):
-            Id of the beginning of sentence token in the vocabulary.
-        eos_token_id (`int`, *optional*, defaults to 50256):
-            Id of the end of sentence token in the vocabulary.
     ```"""
 
     model_type = "custom_rnnv0"
@@ -176,15 +210,14 @@ class CustomRNNConfig(PretrainedConfig):
         n_positions=1024,
         n_embd=768,
         n_layer=12,
-        n_head=12,
         bias=True,
         activation_function="standard",
         dropout=0.0,
         layer_norm_epsilon=1e-5,
         initializer_range=0.02,
-        bos_token_id=50256,
-        eos_token_id=50256,
         pos_emb=False,
+        detach_steps=None,
+        reset_every=None,
         rnn_cell_class="LSTMCell",
         rnn_kwargs={},
         **kwargs,
@@ -197,15 +230,14 @@ class CustomRNNConfig(PretrainedConfig):
         self.n_positions = n_positions
         self.n_embd = n_embd
         self.n_layer = n_layer
-        self.n_head = n_head
         self.activation_function = activation_function
         self.dropout = dropout
         self.layer_norm_epsilon = layer_norm_epsilon
         self.initializer_range = initializer_range
-        self.bos_token_id = bos_token_id
-        self.eos_token_id = eos_token_id
+        self.detach_steps = detach_steps
+        self.reset_every = reset_every
 
-        super().__init__(bos_token_id=bos_token_id, eos_token_id=eos_token_id, **kwargs)
+        super().__init__(**kwargs)
 
     def update_from_string(self, update_str: str):
         """
@@ -298,25 +330,8 @@ class CustomRNNmodel(nn.Module):
                 p.data.normal_(mean=0.0, std=(self.config.initializer_range / math.sqrt(2 * self.config.n_layer)))
 
     def forward(self, input_ids, labels=None, attention_mask=None, hidden=None):
-        detach_steps = 100000
-        if self.training:
-            self.step_count += 1
-            B, T = input_ids.size()
-
-            max_length = min(T, int(self.step_count // 20 // 12) + 2)
-            detach_steps = 50
-            max_examples = T // max_length * max_length
-            input_ids = input_ids[:, :max_examples]
-            input_ids = rearrange(input_ids, "B (E T) -> (B E) T", T=max_length)
-            labels = labels[:, :max_examples]
-            labels = rearrange(labels, "B (E T) -> (B E) T", T=max_length)
-            if attention_mask is not None:
-                raise NotImplementedError("Attention mask not implemented")
-                attention_mask = attention_mask[:, :max_examples]
-                attention_mask = rearrange(attention_mask, "B (E T) -> (B E) T", T=max_length)
-            if random.random() < 0.01:
-                print("length", max_length)
-
+        if attention_mask is not None:
+            raise NotImplementedError("Attention mask not implemented")
         B, T = input_ids.size()
         if self.config.pos_emb:
             pos = torch.arange(0, T, dtype=torch.long, device=input_ids.device)
@@ -324,7 +339,9 @@ class CustomRNNmodel(nn.Module):
         else:
             features = self.word_emb(input_ids)
         features = self.drop(features)
-        x, hidden = self.rnn_model(features, hidden=hidden, detach_steps=detach_steps)
+        x, hidden = self.rnn_model(
+            features, hidden=hidden, detach_steps=self.config.detach_steps, reset_every=self.config.reset_every
+        )
         x = self.norm(x)
         logits = self.lin_head(x)
 
@@ -336,19 +353,27 @@ class CustomRNNmodel(nn.Module):
                 vocab_size=self.config.vocab_size,
                 # **kwargs,
             )
-        return CausalLMOutputWithCrossAttentions(loss=loss, logits=logits, hidden_states=hidden)
+        detach_hidden = []
+        for h in hidden:
+            if isinstance(h, tuple):
+                detach_hidden.append((hh.detach() for hh in h))
+            else:
+                detach_hidden.append(h.detach() if h is not None else None)
+        return CausalLMOutputWithCrossAttentions(loss=loss, logits=logits, hidden_states=detach_hidden)
 
     def get_input_embeddings(self):
         return self.word_emb
 
     @torch.no_grad()
-    def generate(self, idx, max_length, temperature=1.0, top_k=None):
+    def generate(self, idx, max_length, temperature=1.0, top_k=None, eos_token_id=None):
         """
         Take a conditioning sequence of indices idx (LongTensor of shape (b,t)) and complete
         the sequence max_new_tokens times, feeding the predictions back into the model each time.
         Most likely you'll want to make sure to be in model.eval() mode of operation for this.
         """
         hidden = None
+        done = torch.zeros((idx.size(0), 1), dtype=torch.bool, device=idx.device)
+        out_idx = idx
         for _ in range(max_length):
             # forward the model to get the logits for the index in the sequence
             out = self(idx, hidden=hidden)
@@ -365,6 +390,11 @@ class CustomRNNmodel(nn.Module):
             # sample from the distribution
             idx_next = torch.multinomial(probs, num_samples=1)
             # append sampled index to the running sequence and continue
-            print(idx.shape, idx_next.shape)
+            out_idx = torch.cat((out_idx, idx_next), dim=1)
+            if eos_token_id is not None:
+                assert done.shape == idx_next.shape, f"{done.shape} != {idx_next.shape}"
+                done = done | (idx_next == eos_token_id)
+                if done.all():
+                    break
             idx = idx_next
-        return idx
+        return out_idx

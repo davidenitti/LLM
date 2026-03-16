@@ -1,127 +1,185 @@
 import json
+import sys
 
 
 def convert_string_format_to_json_like(input_string):
     """
     Converts a string like 'key:value,key:{...},key:number'
     into a JSON-like string '"key":"value","key":{...},"key":number'.
-
-    Assumes the input format follows:
-    - Top-level key-value pairs separated by commas.
-    - Key-value within a pair separated by the first colon.
-    - Keys are simple strings (will be quoted).
-    - Values can be:
-        - Simple strings (will be quoted).
-        - Numbers (int or float, will remain unquoted).
-        - Booleans (True/False, case-insensitive, converted to json 'true'/'false').
-        - Null (null/None, case-insensitive, converted to json 'null').
-        - Nested structures enclosed in {}. The content inside {} follows the same format.
-    - Commas and colons inside {} are ignored for top-level splitting.
-    - No escaping is handled within simple string values in the input format.
+    it supports lists: key:[1,2,3]
     """
+    if '"' in input_string:
+        return "{" + input_string + "}"  # Assume already in correct format
+
     output_parts = []
     brace_level = 0
+    bracket_level = 0
     start_index = 0
-    s = input_string.strip()  # Remove leading/trailing whitespace from the whole string
+    s = input_string.strip()
 
     if not s:
-        return ""  # Handle empty input
+        return ""
 
-    # Iterate through the string to find top-level commas, respecting braces
     for i in range(len(s)):
         if s[i] == "{":
             brace_level += 1
         elif s[i] == "}":
             brace_level -= 1
-        elif s[i] == "," and brace_level == 0:
-            # Found a top-level segment separator
+        elif s[i] == "[":
+            bracket_level += 1
+        elif s[i] == "]":
+            bracket_level -= 1
+        elif s[i] == "," and brace_level == 0 and bracket_level == 0:
             segment = s[start_index:i].strip()
-            if segment:  # Avoid processing empty segments from leading/trailing/double commas
+            if segment:
                 processed_segment = process_key_value_segment(segment)
-                if processed_segment is not None:  # process_key_value_segment returns None on error
+                if processed_segment is not None:
                     output_parts.append(processed_segment)
             start_index = i + 1
 
-    # Process the last segment after the loop
     last_segment = s[start_index:].strip()
     if last_segment:
         processed_segment = process_key_value_segment(last_segment)
         if processed_segment is not None:
             output_parts.append(processed_segment)
     result = ",".join(output_parts)
-    assert result.replace('"', "") == input_string.replace(" ", "")
-    return result
+    return "{" + result + "}"
 
 
 def process_key_value_segment(segment_string):
     """
     Processes a single 'key:value' segment extracted from the main string.
     Splits by the first top-level colon, quotes the key, and processes the value.
+    Now also supports lists: key:[1,2,3]
     """
     brace_level = 0
+    bracket_level = 0
     colon_index = -1
 
-    # Find the first colon that is NOT inside braces {}
     for i in range(len(segment_string)):
         if segment_string[i] == "{":
             brace_level += 1
         elif segment_string[i] == "}":
             brace_level -= 1
-        elif segment_string[i] == ":" and brace_level == 0:
+        elif segment_string[i] == "[":
+            bracket_level += 1
+        elif segment_string[i] == "]":
+            bracket_level -= 1
+        elif segment_string[i] == ":" and brace_level == 0 and bracket_level == 0:
             colon_index = i
             break
 
     if colon_index == -1:
-        # Malformed segment: no top-level colon found
+        raise ValueError(f"Segment '{segment_string}' does not contain a top-level colon.")
         print(f"Warning: Segment '{segment_string}' does not contain a top-level colon. Skipping.")
-        return None  # Indicate failure or skip this segment
+        return None
 
     key = segment_string[:colon_index].strip()
     value_str = segment_string[colon_index + 1 :].strip()
-
-    # Process key: Always quote the key
-    # Use json.dumps to handle potential edge cases in keys if necessary, though simple keys expected
     processed_key = json.dumps(key)
 
-    # Process value
     processed_value = ""
     if value_str.startswith("{") and value_str.endswith("}"):
-        # Value is a nested structure - recursively process its content
-        nested_content = value_str[1:-1].strip()  # Get content inside {}
+        nested_content = value_str[1:-1].strip()
         processed_nested_content = convert_string_format_to_json_like(nested_content)
-        processed_value = "{" + processed_nested_content + "}"  # Re-wrap in {}
-
+        processed_value = "{" + processed_nested_content + "}"
+    elif value_str.startswith("[") and value_str.endswith("]"):
+        # Try to parse the list using json.loads, fallback to quoting as string if fails
+        try:
+            parsed_list = json.loads(value_str)
+            processed_value = json.dumps(parsed_list)
+        except Exception:
+            # If not a valid JSON list, treat as string
+            processed_value = json.dumps(value_str)
     else:
-        # Value is a simple type (string, number, boolean, null)
         lower_value_str = value_str.lower()
-
         if lower_value_str == "true" or lower_value_str == "false" or lower_value_str == "null":
-            # Handle boolean and null keywords directly (case-insensitive input, lowercase output)
             processed_value = lower_value_str
         else:
             try:
-                # Attempt to parse value as a number or an already valid JSON primitive (like "quoted string")
                 parsed_value = json.loads(value_str)
-
-                # If it was parsed as a number (int or float), keep its original string form
                 if isinstance(parsed_value, (int, float)):
                     processed_value = value_str
                 else:
-                    # It was parsed successfully but isn't a number (e.g., "hello" parsed to 'hello').
-                    # json.dumps the original string to get the correct JSON string representation ("hello").
                     processed_value = json.dumps(value_str)
-
             except json.JSONDecodeError:
-                # json.loads failed: the value is likely an unquoted plain string (like SelfAttentionDist).
-                # Quote it using json.dumps to handle potential special characters correctly if needed.
                 processed_value = json.dumps(value_str)
 
     return f"{processed_key}:{processed_value}"
 
 
+def compact_run_name(run_name):
+    run_name = run_name.replace("selfatt_class", "att")
+    run_name = run_name.replace('"', "").replace("'", "")
+    run_name = run_name.replace("dropout:0", "d")
+    run_name = run_name.replace(",rotary_emb:", "rot")
+    run_name = run_name.replace("vocab_size:", "v:")
+    run_name = run_name.replace("context_len", "T")
+    run_name = run_name.replace("gptv0 ", "")
+    run_name = run_name.replace("  ", " ")
+    run_name = run_name.replace("true", "t")
+    run_name = run_name.replace("false", "f")
+    run_name = run_name.replace("selfatt_class_kwargs", "block")
+    run_name = run_name.replace("n_layer:", "layer")
+    run_name = run_name.replace(",v:19,T:9400", "")
+    run_name = run_name.replace("lr0.000", "lr")
+    run_name = run_name.replace("gt_labels_only:", "gtlbl:")
+    run_name = run_name.replace("include_", "")
+    run_name = run_name.replace("mult_test", "mtest")
+
+    return run_name
+
+
+def get_explicit_cli_args(parser, args_list):
+    args_list = sys.argv[1:] if args_list is None else list(args_list)
+    option_string_actions = parser._option_string_actions
+    explicit_dests = set()
+    i = 0
+    while i < len(args_list):
+        arg = args_list[i]
+        if arg == "--":
+            break
+        if arg.startswith("-"):
+            option = arg
+            if "=" in arg:
+                option = arg.split("=", 1)[0]
+            action = option_string_actions.get(option)
+            if action is None:
+                i += 1
+                continue
+            explicit_dests.add(action.dest)
+            if "=" in arg:
+                i += 1
+                continue
+            nargs = action.nargs
+            if nargs is None:
+                i += 2
+                continue
+            if nargs == 0:
+                i += 1
+                continue
+            if isinstance(nargs, int):
+                i += 1 + nargs
+                continue
+            if nargs in ("?", "*", "+"):
+                i += 1
+                while i < len(args_list):
+                    next_arg = args_list[i]
+                    if next_arg == "--":
+                        break
+                    if next_arg in option_string_actions:
+                        break
+                    i += 1
+                continue
+        i += 1
+    return explicit_dests
+
+
 if __name__ == "__main__":
     # Example Usage:
-    input_str = "selfatt_class:SelfAttentionDist,selfatt_class_kwargs:{att_type:dot,pos_emb_mode:sum_mul_x},emb:3"
+    input_str = (
+        "selfatt_class:SelfAttentionDist,selfatt_class_kwargs:{att_type:dot,pos_emb_mode:sum_mul_x},emb:3"
+    )
     output_str = convert_string_format_to_json_like(input_str)
     print(f"Input:  '{input_str}'")
     print(f"Output: '{output_str}'")
