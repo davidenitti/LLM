@@ -407,6 +407,7 @@ Resolved configuration from `arc_agi_l3x10_alllosses.json`:
 At a high level, this model consists of:
 
 - token embeddings
+- rotary positional encoding `rotary_emb=32`
 - 3 transformer-style blocks of class `SelfAttentionV2`
 - final normalization
 - linear LM head
@@ -419,17 +420,6 @@ At a high level, this model consists of:
 - learnable residual scaling parameters `gamma_attn` and `gamma_mlp`
 - dropout on attention and residual paths
 - flash attention through `torch.nn.functional.scaled_dot_product_attention()` when enabled
-
-### Positional encoding
-
-This config uses `rotary_emb=32`, so part of each attention head gets rotary positional encoding.
-
-It does **not** enable:
-
-- `use_pos_emb_2d`
-- `use_rot_emb_2d`
-
-So for this specific model configuration, the ordinary training and validation ARC datasets do not build `position_idx` at all. The dataset code can still generate 2D position indices when a model configuration actually requests 2D positional features.
 
 ### What `repeat_model=10` means here
 When `repeat_model > 1`, the code does not duplicate the whole 3-layer stack in the obvious way. Instead it uses:
@@ -652,13 +642,10 @@ This setup is best understood as:
 
 - a character-level ARC sequence model
 - trained on 960 ARC-family tasks assembled from training, evaluation-derived, and concept splits
-- using output-only supervision (`gt_labels_only=true`)
+- using output-only supervision (`gt_labels_only=true` and `gt_all_out=true`), so the model is supervised on later output tokens from both train and test examples, not only on the test outputs. The main exception is the first training example's output.
 - with strong geometric/color/task-structure augmentation on training examples
 - with a 3-block standalone transformer where the middle block is repeated 10 times
 - with auxiliary losses on later repeated states
-- using bf16, AdamW, cosine decay with a minimum LR, and `torch.compile()`
-
-Two implementation details are especially important for interpretation:
-
-1. The training set is broader than the official ARC training split because it includes evaluation-derived tasks and concept tasks. This is common practice because the dataset is small.
-2. The model is trained on later output tokens from both train and test examples, not only on the test outputs. The main exception is the first training example's output.
+- using bf16, AdamW, cosine decay
+- high weight decay and dropout to regularize the model on the small dataset
+- a loss that is manually normalized by context length and batch size rather than a plain mean reduction. This should improve training, but a more systematic comparison of `reduce_loss="sum"` vs `reduce_loss="mean"` is left for future work.
