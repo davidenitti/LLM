@@ -1,29 +1,74 @@
 import glob
 import os
+import shutil
+import traceback
 
 import torch
 from accelerate import Accelerator
-import shutil
-import traceback
 
 from scheduler import create_lr_scheduler, create_optimizer, update_optimizer_weight_decay
 
 
+CHECKPOINTS_TO_KEEP = 2
+
+
+def paired_model_checkpoint_path(checkpoint_path):
+    if checkpoint_path.endswith("_accelerator"):
+        return checkpoint_path[: -len("_accelerator")]
+    return checkpoint_path
+
+
+def checkpoint_step_from_path(checkpoint_path):
+    checkpoint_name = os.path.basename(paired_model_checkpoint_path(checkpoint_path))
+    return int(checkpoint_name.replace("step_", ""))
+
+
+def list_checkpoint_accelerators(output_dir):
+    """Return accelerator checkpoint dirs sorted from newest to oldest."""
+    checkpoints = []
+    if output_dir is None or not os.path.exists(output_dir):
+        return checkpoints
+
+    for check_path in glob.glob(os.path.join(output_dir, "step_*_accelerator")):
+        if not os.path.isdir(check_path):
+            continue
+        try:
+            checkpoints.append((checkpoint_step_from_path(check_path), check_path))
+        except ValueError:
+            continue
+    checkpoints.sort(key=lambda x: x[0], reverse=True)
+    return [path for _, path in checkpoints]
+
+
+def list_checkpoint_dirs(output_dir):
+    checkpoint_dirs = []
+    if output_dir is None or not os.path.exists(output_dir):
+        return checkpoint_dirs
+
+    for check_path in glob.glob(os.path.join(output_dir, "step_*")):
+        if os.path.isdir(check_path):
+            checkpoint_dirs.append(check_path)
+    return checkpoint_dirs
+
+
+def checkpoint_recovery_hint(checkpoint_path):
+    model_dir = paired_model_checkpoint_path(checkpoint_path)
+    model_weights = os.path.join(model_dir, "pytorch_model.bin")
+    if os.path.isfile(model_weights):
+        return (
+            f" Paired model checkpoint exists at {model_dir}; "
+            f"if {model_weights} is still readable, you can restart from weights only "
+            f"with --model_name_or_path {model_weights}."
+        )
+    return ""
+
+
 def get_last_checkpoint(output_dir):
     """Return the most recent accelerator checkpoint directory in `output_dir`."""
-    checkpoints = []
-    if os.path.exists(output_dir):
-        for check_path in glob.glob(os.path.join(output_dir, "epoch_*_accelerator")):
-            if os.path.isdir(check_path):
-                try:
-                    epoch_num = int(os.path.basename(check_path).split("_")[1])
-                    checkpoints.append((epoch_num, check_path))
-                except:
-                    pass
+    checkpoints = list_checkpoint_accelerators(output_dir)
     if len(checkpoints) == 0:
         return None
-    checkpoints = sorted(checkpoints, key=lambda x: x[0], reverse=True)
-    return checkpoints[0][1]
+    return checkpoints[0]
 
 
 def save_checkpoint(
@@ -32,32 +77,30 @@ def save_checkpoint(
     model,
     tokenizer,
     args,
-    epoch: int,
+    completed_steps: int,
 ) -> None:
-    """Save a synchronized epoch checkpoint for the accelerator, model, and tokenizer.
+    """Save a synchronized checkpoint for the accelerator, model, and tokenizer.
 
     This function contains `accelerator.wait_for_everyone()` barriers, so every
     rank must call it consistently. Save failures are treated as non-fatal and
     partial checkpoint directories are cleaned up on a best-effort basis.
     """
-    # Important: to be multi-GPU safe, every rank must hit the same barriers even if saving fails.
-    # We treat save failures as non-fatal (do not stop training), but we also avoid deleting the
-    # previous checkpoint unless the new one is confirmed saved successfully across all ranks.
+    if args.output_dir is None:
+        return
 
-    if args.output_dir is not None:
-        output_dir = os.path.join(args.output_dir, f"epoch_{epoch}")
+    checkpoint_name = f"step_{completed_steps}"
+    output_dir = os.path.join(args.output_dir, checkpoint_name)
+    accelerator_output_dir = output_dir + "_accelerator"
 
-    # Align ranks before saving.
     accelerator.wait_for_everyone()
 
     local_ok = True
     try:
-        accelerator.save_state(output_dir + "_accelerator")
+        accelerator.save_state(accelerator_output_dir)
     except Exception as e:
         local_ok = False
         if accelerator.is_main_process:
-            print(f"Warning: failed to save accelerator state at epoch {epoch}: {e}")
-
+            print(f"Warning: failed to save accelerator state at {checkpoint_name}: {e}")
             traceback.print_exc()
 
     accelerator.wait_for_everyone()
@@ -78,8 +121,7 @@ def save_checkpoint(
     except Exception as e:
         local_ok = False
         if accelerator.is_main_process:
-            print(f"Warning: failed to save model/tokenizer at epoch {epoch}: {e}")
-
+            print(f"Warning: failed to save model/tokenizer at {checkpoint_name}: {e}")
             traceback.print_exc()
 
     accelerator.wait_for_everyone()
@@ -95,31 +137,52 @@ def save_checkpoint(
         torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.MIN)
         global_ok = bool(int(t.item()))
 
-    # If save failed anywhere, keep previous checkpoint pointer and optionally cleanup partial dirs on main.
+    # If save failed anywhere, keep older checkpoints and cleanup partial dirs on main.
     if not global_ok:
         if accelerator.is_main_process:
             print("Warning: checkpoint save failed on at least one rank; continuing training.")
             try:
                 if os.path.exists(output_dir):
                     shutil.rmtree(output_dir)
-                if os.path.exists(output_dir + "_accelerator"):
-                    shutil.rmtree(output_dir + "_accelerator")
+                if os.path.exists(accelerator_output_dir):
+                    shutil.rmtree(accelerator_output_dir)
             except Exception as e:
-                print(f"Warning: failed to cleanup partial checkpoint at epoch {epoch}: {e}")
+                print(f"Warning: failed to cleanup partial checkpoint at {checkpoint_name}: {e}")
         accelerator.wait_for_everyone()
+        return
 
     # New checkpoint is good; now cleanup old checkpoint dirs only on main (best-effort).
     if accelerator.is_main_process:
-        dir2delete = glob.glob(os.path.join(args.output_dir, "epoch_*"))
-        for d in dir2delete:
+        keep_accelerator_dirs = set(list_checkpoint_accelerators(args.output_dir)[:CHECKPOINTS_TO_KEEP])
+        keep_dirs = keep_accelerator_dirs | {
+            paired_model_checkpoint_path(checkpoint_path) for checkpoint_path in keep_accelerator_dirs
+        }
+        for checkpoint_dir in list_checkpoint_dirs(args.output_dir):
             try:
-                if os.path.exists(d) and d != output_dir and d != output_dir + "_accelerator":
-                    shutil.rmtree(d)
-                    print("Removed old checkpoint:", d)
+                if os.path.exists(checkpoint_dir) and checkpoint_dir not in keep_dirs:
+                    shutil.rmtree(checkpoint_dir)
+                    print("Removed old checkpoint:", checkpoint_dir)
             except Exception as e:
-                print(f"Warning: failed to remove old checkpoint {d}: {e}")
+                print(f"Warning: failed to remove old checkpoint {checkpoint_dir}: {e}")
 
     accelerator.wait_for_everyone()
+
+
+def resume_candidates(*, resume, output_dir):
+    if resume == "":
+        # return all checkpoints in output_dir to resume
+        return list_checkpoint_accelerators(output_dir)
+
+    checkpoint_path = resume.rstrip("/")
+    candidates = [checkpoint_path]
+    if output_dir is None:
+        return candidates
+
+    checkpoint_path_abs = os.path.abspath(checkpoint_path)
+    for candidate in list_checkpoint_accelerators(output_dir):
+        if os.path.abspath(candidate) != checkpoint_path_abs:
+            candidates.append(candidate)
+    return candidates
 
 
 def resume_training(
@@ -137,27 +200,43 @@ def resume_training(
 ):
     """Resume from a checkpoint and return the restored training state."""
     checkpoint_path = None
-    dir_checkpoint = None
     starting_epoch = 1
     completed_steps = 0
     resume_step = None
 
     if args.resume is not None:
-        if args.resume != "":
-            checkpoint_path = args.resume.rstrip("/")
-            dir_checkpoint = os.path.basename(checkpoint_path)
+        candidate_checkpoints = resume_candidates(resume=args.resume, output_dir=args.output_dir)
+        if len(candidate_checkpoints) == 0:
+            print(f"No checkpoint found in output directory {args.output_dir}")
         else:
-            checkpoint_path = get_last_checkpoint(args.output_dir)
-            if checkpoint_path is None:
-                print(f"No checkpoint found in output directory {args.output_dir}")
-            else:
-                dir_checkpoint = os.path.basename(checkpoint_path)
+            load_errors = []
+            for index, candidate_path in enumerate(candidate_checkpoints):
+                accelerator.print(f"Resume from checkpoint: {candidate_path}")
+                try:
+                    accelerator.load_state(candidate_path)
+                    checkpoint_path = candidate_path
+                    if index > 0:
+                        accelerator.print(f"Loaded fallback checkpoint {candidate_path}.")
+                    break
+                except Exception as e:
+                    load_errors.append((candidate_path, str(e)))
+                    if index + 1 < len(candidate_checkpoints):
+                        accelerator.print(f"Failed to load checkpoint {candidate_path}: {e}")
+
+            if checkpoint_path is None and len(load_errors) > 0:
+                if len(load_errors) == 1:
+                    failed_path, error = load_errors[0]
+                    raise RuntimeError(
+                        f"Failed to load checkpoint {failed_path}: {error}.{checkpoint_recovery_hint(failed_path)}"
+                    )
+                error_summary = "\n".join(
+                    f"  - {failed_path}: {error}{checkpoint_recovery_hint(failed_path)}"
+                    for failed_path, error in load_errors
+                )
+                raise RuntimeError("Failed to load all available checkpoints:\n" + error_summary)
 
     if checkpoint_path is None:
         return checkpoint_path, optimizer, lr_scheduler, starting_epoch, completed_steps, resume_step
-
-    accelerator.print(f"Resume from checkpoint: {checkpoint_path}")
-    accelerator.load_state(checkpoint_path)
 
     if args.reset_resume:
         accelerator.print("Resetting optimizer and scheduler states after resume.")
@@ -187,15 +266,10 @@ def resume_training(
         scale_lowrank=args.scale_lowrank,
     )
 
-    training_difference = os.path.splitext(dir_checkpoint)[0]
-    if "epoch" in training_difference:
-        starting_epoch = int(training_difference.replace("epoch_", "").split("_")[0]) + 1
-        completed_steps = (starting_epoch - 1) * num_update_steps_per_epoch
-    else:
-        # need to multiply `gradient_accumulation_steps` to reflect real steps
-        resume_step = int(training_difference.replace("step_", "")) * args.gradient_accumulation_steps
-        starting_epoch = resume_step // len(train_dataloader) + 1
-        completed_steps = resume_step // args.gradient_accumulation_steps
-        resume_step -= resume_step // len(train_dataloader) * len(train_dataloader)
+    # Need to multiply `gradient_accumulation_steps` to reflect real steps.
+    completed_steps = checkpoint_step_from_path(checkpoint_path)
+    resume_step = completed_steps * args.gradient_accumulation_steps
+    starting_epoch = resume_step // len(train_dataloader) + 1
+    resume_step -= resume_step // len(train_dataloader) * len(train_dataloader)
 
     return checkpoint_path, optimizer, lr_scheduler, starting_epoch, completed_steps, resume_step

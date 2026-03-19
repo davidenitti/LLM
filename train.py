@@ -1374,7 +1374,7 @@ def train(args):
             active_dataloader = accelerator.skip_first_batches(train_dataloader, resume_step)
         else:
             active_dataloader = train_dataloader
-        for orig_step, orig_batch in enumerate(active_dataloader):
+        for orig_batch in active_dataloader:
             if (
                 args.save_checkpoint_steps > 0
                 and completed_steps % args.save_checkpoint_steps == 0
@@ -1385,7 +1385,7 @@ def train(args):
                     model=model,
                     tokenizer=tokenizer,
                     args=args,
-                    epoch=epoch,
+                    completed_steps=completed_steps,
                 )
             if random.random() < args.rand_shift_prob:
                 shift = random.randint(1, args.max_rand_shift)

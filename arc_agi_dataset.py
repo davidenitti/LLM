@@ -661,7 +661,11 @@ def create_prompt(task, think_budget=0, repeat_test=1, max_length=None, compute_
 
 
 def clone_task_structure(task):
-    """Create a lightweight copy of an ARC task before in-place augmentation."""
+    """
+    Create a fast shallow copy of an ARC task before in-place augmentation.
+    there is a pytest tests/test_apply_augmentation_clone.py to check that the shallow copy is sufficient and that
+    the original task is not modified after augmentation.
+    """
 
     cloned = {k: v for k, v in task.items() if k not in {"train", "test"}}
     cloned["train"] = [dict(example) for example in task["train"]]

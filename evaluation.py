@@ -1,3 +1,4 @@
+import logging
 import math
 from random import random
 from time import time
@@ -11,6 +12,8 @@ import numpy as np
 from collections import Counter
 from utils.cuda_utils import clean_gpu, retry_on_cuda_oom
 from arc_agi_dataset import decode_predicted_output_grids, inverse_augmentation
+
+LOGGER = logging.getLogger(__name__)
 
 
 def _tta_worker_init_fn(worker_id: int) -> None:
@@ -66,6 +69,7 @@ def build_tta_dataloader(
         worker_init_fn=_tta_worker_init_fn,
         **loader_kwargs,
     )
+
 
 def compute_valv2(
     model,
@@ -445,8 +449,8 @@ def compute_acc_tta_pass2(
                 take = min(num_aug - len(samples), len(pending_batch))
                 samples.extend(pending_batch[:take])
                 pending_batch = pending_batch[take:]
-            if random() < 0.1:
-                print("time", time() - starttime)
+            if random() < 0.05:
+                LOGGER.debug("time: %f", time() - starttime)
             # Basic per-sample consistency checks.
             max_size = 0
             for s in samples:
@@ -639,8 +643,6 @@ def compute_acc_tta_pass2(
 
             correct += 1 if ok else 0
             total += 1
-            if (idx + 1) % 20 == 0:
-                print(f"TTA pass@2 interim: {100*correct/total:.2f}%")
 
     model.train()
     return (correct / total) if total > 0 else 0.0

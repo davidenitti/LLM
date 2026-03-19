@@ -21,13 +21,8 @@ from rotary_pos import precompute_freqs
 from utils.checks import check_model
 from utils.config_utils import convert_string_format_to_json_like
 
-try:
-    from blocks.basic_transformer import SelfAttention, SelfAttentionV2
-    from blocks.conv3d_transformer import SelfAttentionConv3d
-    from blocks.cum_sum_transformer import SelfAttentionCumSumV2, SelfAttentionCumSumV3
-    from blocks.new_transformers import SelfAttentionConv
-except Exception as e:
-    print(e)
+from blocks.basic_transformer import SelfAttention, SelfAttentionV2
+
 
 logger = logging.getLogger(__name__)
 
